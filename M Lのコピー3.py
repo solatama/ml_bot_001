@@ -17,6 +17,10 @@ import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
 import optuna
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.base import BaseEstimator, ClassifierMixin
 from optuna.pruners import MedianPruner
 
 # === 定数定義 ===
@@ -29,7 +33,7 @@ STOP_LOSS = 0.02
 TAKE_PROFIT = 0.05
 COMMISSION = 0.001
 SLIPPAGE = 0.001
-SELECTED_MODELS = ['xgboost', 'randomforest', 'catboost', 'lightgbm'] #'lightgbm',
+SELECTED_MODELS = ['lightgbm', 'xgboost', 'randomforest', 'catboost', 'mlp', 'transformer', 'rnn']
 ENSEMBLE_TYPE = 'stacking'  # 'blending', 'stacking', 'voting_hard', 'voting_soft'
 
 # === LightGBM Sklearn Wrapper ===
@@ -339,7 +343,107 @@ def select_top_features_with_lightgbm(df, target, top_n=10):
     return top_features
 
 # === モデル作成 ===
-def create_model(model_type, params=None):
+# Transformer本体
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, d_model=64, nhead=4, num_layers=2, dim_feedforward=128):
+        super().__init__()
+        self.input_layer = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.output_layer = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = self.input_layer(x)
+        x = self.transformer(x)
+        x = x.mean(dim=1)  # 時系列長方向に平均
+        return self.output_layer(x)
+
+# RNN本体
+class RNNModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2):
+        super().__init__()
+        self.rnn = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        out = out[:, -1, :]  # 最後の時刻の出力を使う
+        return self.fc(out)
+
+# MLP本体
+class MLPModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class BaseTorchWrapper(BaseEstimator, ClassifierMixin):
+    def __init__(self, model_class, input_dim, epochs=10, batch_size=32, lr=1e-3, device=None):
+        self.model_class = model_class
+        self.input_dim = input_dim
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = self.model_class(self.input_dim).to(self.device)
+
+    def fit(self, X, y):
+        X = torch.tensor(X, dtype=torch.float32).unsqueeze(1).to(self.device)  # [B, 1, F]
+        y = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(self.device)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        criterion = nn.BCEWithLogitsLoss()
+        self.model.train()
+
+        for epoch in range(self.epochs):
+            permutation = torch.randperm(X.size(0))
+            for i in range(0, X.size(0), self.batch_size):
+                indices = permutation[i:i+self.batch_size]
+                batch_X, batch_y = X[indices], y[indices]
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+
+        return self
+
+    def predict_proba(self, X):
+        self.model.eval()
+        X = torch.tensor(X, dtype=torch.float32).unsqueeze(1).to(self.device)
+        with torch.no_grad():
+            logits = self.model(X)
+            probs = torch.sigmoid(logits)
+        probs = probs.cpu().numpy()
+        return np.hstack([1 - probs, probs])
+
+    def predict(self, X):
+        proba = self.predict_proba(X)[:, 1]
+        return (proba > 0.5).astype(int)
+
+# Transformer用
+class TransformerWrapper(BaseTorchWrapper):
+    def __init__(self, input_dim, **kwargs):
+        super().__init__(TransformerModel, input_dim, **kwargs)
+
+# RNN用
+class RNNWrapper(BaseTorchWrapper):
+    def __init__(self, input_dim, **kwargs):
+        super().__init__(RNNModel, input_dim, **kwargs)
+
+# MLP用
+class MLPWrapper(BaseTorchWrapper):
+    def __init__(self, input_dim, **kwargs):
+        super().__init__(MLPModel, input_dim, **kwargs)
+
+def create_model(model_type, FEATURES, params=None):
     if model_type == 'lightgbm':
         return lgb.LGBMClassifier(**params)
     elif model_type == 'xgboost':
@@ -350,8 +454,17 @@ def create_model(model_type, params=None):
         return RandomForestClassifier(**params)
     elif model_type == 'mlp':
         return MLPClassifier(max_iter=500, **params)
+    elif model_type == 'transformer':
+        return TransformerWrapper(input_dim=len(FEATURES), **params)
+    elif model_type == 'rnn':
+        return RNNWrapper(input_dim=len(FEATURES), **params)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
+
+    return Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('classifier', model)
+    ])
 
 # === Optunaによるハイパーパラメータ最適化 ===
 def optimize_hyperparameters(df, model_type):
@@ -614,7 +727,7 @@ def main():
     backtest_results = run_backtest(df, ensemble_model, FEATURES)
 
     # バックテスト結果の出力
-    print("\nバックテスト結果:")
+    print("\n通常バックテスト結果:")
     print(f"総損益: {backtest_results['total_pnl']:.2f}")
     print(f"勝率: {backtest_results['win_rate']:.2%}")
     print(f"シャープレシオ: {backtest_results['sharpe_ratio']:.2f}")
@@ -625,14 +738,19 @@ def main():
         print(f"有意判定: {'YES 🎯' if backtest_results['significant'] else 'NO ⚠'}")
         print(f"エラー率推定: {backtest_results['error_rate']:.1e}")
 
-    # # ウォークフォワード分析
-    # ensemble_model.fit(df[FEATURES], df['long_target'])
-    # walk_forward_results = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
+    # ===== ウォークフォワード分析も実行する =====
+    print("\n🚶‍♂️ ウォークフォワード分析開始...")
+    walk_forward_results = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
 
-    # # 全体の結果を集計
-    # total_pnl = sum(result['total_pnl'] for result in walk_forward_results)
-    # print("\nウォークフォワード分析の総結果:")
-    # print(f"総損益: {total_pnl:.2f}")
+    # 全体の結果を集計
+    total_pnl = sum(result['total_pnl'] for result in walk_forward_results)
+    avg_sharpe = np.mean([result['sharpe_ratio'] for result in walk_forward_results])
+    avg_drawdown = np.mean([result['max_drawdown'] for result in walk_forward_results])
+
+    print("\n🏁 ウォークフォワード分析の総結果:")
+    print(f"総損益: {total_pnl:.2f}")
+    print(f"平均シャープレシオ: {avg_sharpe:.2f}")
+    print(f"平均最大ドローダウン: {avg_drawdown:.2%}")
 
     end_time = time.time()
     print(f"✅ 全体の実行時間: {end_time - start_time:.2f} 秒")
