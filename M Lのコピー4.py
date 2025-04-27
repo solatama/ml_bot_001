@@ -25,13 +25,11 @@ START_DATE = '2024-04-01'
 END_DATE = '2025-04-10'
 INTERVAL = '1d'
 FEATURES = ['close_scaled']
-STOP_LOSS = 0.02
-TAKE_PROFIT = 0.05
-STOP_LOSS_MODE = 3  # 1: 固定幅損切り, 2: ATR損切り, 3: パラボリックSARトレイリング
-FIXED_STOP_LOSS_PERCENT = 0.02  # 固定幅2%（STOP_LOSS_MODE=1用）
-ATR_MULTIPLIER = 2.0            # ATR損切り用倍率（STOP_LOSS_MODE=2用）
-COMMISSION = 0.001
-SLIPPAGE = 0.001
+STOP_LOSS_MODE = 1  # 1:固定パーセント損切り 2:パラボリックSAR損切り 3:直近安値更新
+STOP_LOSS = 0.02    # 固定パーセント損切りでの損失許容率（例:2%）
+TAKE_PROFIT = 0.04  # 利確幅（例:4%）
+COMMISSION = 0.0005  # 手数料率（必要なら設定）
+SLIPPAGE = 0.0005    # スリッページ率（必要なら設定）
 SELECTED_MODELS = ['xgboost', 'randomforest', 'catboost', 'lightgbm'] #'lightgbm',
 ENSEMBLE_TYPE = 'stacking'  # 'blending', 'stacking', 'voting_hard', 'voting_soft'
 
@@ -299,23 +297,38 @@ def calc_features(df):
     df.dropna(inplace=True)
     return df
 
-# === 相関係数による特徴量削除関数 ===
+# === 相関係数による特徴量削除関数（改良版） ===
+# === 相関係数による特徴量削除関数（さらにスマート改良版） ===
 def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
     """
-    高い相関を持つ特徴量を削除する。
+    高い相関を持つ特徴量を削除する（open, high, low, close, volumeはデフォルトで守る）。
     :param df: 特徴量データフレーム
     :param threshold: 相関係数の閾値
-    :param exclude_columns: 削除対象から除外する列のリスト
+    :param exclude_columns: 削除対象から除外する列のリスト（デフォルトでOHLCVを除外）
     :return: 相関が高くない特徴量を持つデータフレーム
     """
     if exclude_columns is None:
-        exclude_columns = []
+        exclude_columns = ['open', 'high', 'low', 'close', 'volume']
 
+    print(f"🔍 相関除去前の特徴量数: {df.shape[1]}列")
+
+    # 相関行列を計算
     corr_matrix = df.corr().abs()
     upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > threshold) and column not in exclude_columns]
+
+    # 削除対象の列を特定（除外リストに含まれる列は削除しない）
+    to_drop = [
+        column for column in upper_triangle.columns
+        if any(upper_triangle[column] > threshold) and column not in exclude_columns
+    ]
+
     print(f"🛠️ 削除された高相関特徴量: {to_drop}")
-    return df.drop(columns=to_drop)
+
+    df_dropped = df.drop(columns=to_drop)
+
+    print(f"✅ 相関除去後の特徴量数: {df_dropped.shape[1]}列")
+
+    return df_dropped
 
 # === LightGBM重要度で上位特徴量を選択 ===
 def select_top_features_with_lightgbm(df, target, top_n=10):
@@ -406,6 +419,33 @@ def optimize_hyperparameters(df, model_type):
     study.optimize(objective, n_trials=30)
     return study.best_params
 
+# === 損切り・利確判定関数 ===
+def should_exit(position, entry_price, current_price, high, low, sar, stop_loss_mode):
+    """
+    損切り・利確判定をする関数
+    """
+    if position != 'long':
+        return False
+
+    # モード1: 固定パーセント
+    if stop_loss_mode == 1:
+        stop_loss_price = entry_price * (1 - STOP_LOSS)
+        take_profit_price = entry_price * (1 + TAKE_PROFIT)
+        if low <= stop_loss_price or high >= take_profit_price:
+            return True
+
+    # モード2: パラボリックSAR
+    elif stop_loss_mode == 2:
+        if sar is not None and low < sar:
+            return True
+
+    # モード3: 直近安値割れ
+    elif stop_loss_mode == 3:
+        if low < entry_price * 0.98:  # 仮に直近2%下で損切り
+            return True
+
+    return False
+
 def p_mean_test(returns, period=14, alpha=0.03):
     """
     p平均法によるストラテジー有意性検定
@@ -459,38 +499,29 @@ def run_backtest(df, model, features):
     trade_log = []
     equity_curve = [1.0]  # 資産曲線（初期資産を1.0とする）
 
+    df_selected = remove_highly_correlated_features(df)
+
     for i, pred in enumerate(predictions):
         close_price = df.iloc[i]['close']
-        high = df.iloc[i]['high']
-        low = df.iloc[i]['low']
-        atr = df.iloc[i].get('atr', 0)  # ATR列がある前提。なければ0
-        parabolic_sar = df.iloc[i].get('parabolic_sar', 0)  # SAR列がある前提。なければ0
+        high_price = df.iloc[i]['high']
+        low_price = df.iloc[i]['low']
+        sar = df.iloc[i]['SAR'] if 'SAR' in df.columns else None  # SARが存在する場合のみ取得
 
+        # エントリー条件
         if position is None and pred > 0.5:
             position = 'long'
             entry_price = close_price
             trade_log.append(('BUY', close_price))
 
+        # エグジット条件
         if position == 'long':
-            # 損切り判定
-            if should_stop_loss(entry_price, close_price, atr, parabolic_sar, is_long=True):
+            if should_exit(position, entry_price, close_price, high_price, low_price, sar, STOP_LOSS_MODE):
                 profit = close_price - entry_price - (close_price * COMMISSION + close_price * SLIPPAGE)
                 pnl.append(profit)
                 position = None
                 trade_log.append(('SELL', close_price))
                 # 資産曲線を更新
                 equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
-                continue  # 売ったら次の足へ
-
-            # 利確条件（従来のTake Profitルール）
-            take_profit = entry_price * (1 + TAKE_PROFIT)
-            if close_price >= take_profit:
-                profit = close_price - entry_price - (close_price * COMMISSION + close_price * SLIPPAGE)
-                pnl.append(profit)
-                position = None
-                trade_log.append(('SELL', close_price))
-                equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
-                continue
 
     # シャープレシオの計算
     daily_returns = np.diff(equity_curve) / equity_curve[:-1]
@@ -586,9 +617,6 @@ def main():
     df = calc_features(df)
 
     print("🔍 特徴量生成後の列:", df.columns.tolist())
-
-    # パラボリックSARを計算
-    df['parabolic_sar'] = talib.SAR(df['high'], df['low'], acceleration=0.02, maximum=0.2)
 
     # 相関係数による特徴量削除
     df = remove_highly_correlated_features(df, exclude_columns=['close'])
