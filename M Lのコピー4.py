@@ -9,13 +9,19 @@ import talib
 import yfinance as yf
 
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.ensemble import StackingClassifier, RandomForestClassifier
+from sklearn.ensemble import StackingClassifier, RandomForestClassifier, VotingRegressor
 import xgboost as xgb
 import lightgbm as lgb
 import catboost as catb
 
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+import optuna
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import StandardScaler
+
 
 # === 定数定義 ===
 TICKER = '9684.T'
@@ -214,7 +220,7 @@ def calc_features(df):
         'momentum_20': df['close'] - df['close'].shift(20),
     }
 
-    # ローソク足パターンを辞書に追加
+    # ローソク足パターンを辞書に追加(カウントされてないので今後修正する)
     candlestick_patterns = {
         'CDL2CROWS': talib.CDL2CROWS,
         'CDL3BLACKCROWS': talib.CDL3BLACKCROWS,
@@ -281,11 +287,23 @@ def calc_features(df):
 def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
     if exclude_columns is None:
         exclude_columns = ['open', 'high', 'low', 'close', 'volume']
-    corr_matrix = df.corr().abs()
+
+    # 数値データのみを抽出
+    numeric_df = df.select_dtypes(include=[np.number])
+
+    # 相関行列を計算
+    corr_matrix = numeric_df.corr().abs()
+
+    # 上三角行列を取得
     upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    # 高相関の列を特定
     to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > threshold) and column not in exclude_columns]
+
     print(f"🛠️ 削除された高相関特徴量: {to_drop}")
-    return df.drop(columns=to_drop)
+
+    # 高相関の列を削除
+    return df.drop(columns=to_drop, errors='ignore')
 
 # ========================== PyTorch用ラッパー ==========================
 class BaseTorchWrapper(BaseEstimator, ClassifierMixin):
@@ -387,6 +405,109 @@ def build_stacking(models):
     stack_model = StackingClassifier(estimators=estimators, final_estimator=lgb.LGBMClassifier())
     return stack_model
 
+# Optunaの目的関数定義
+def objective(trial, X_train, y_train, X_test, y_test):
+    # ハイパーパラメータの最適化
+    model_type = trial.suggest_categorical('model_type', ['lightgbm', 'xgboost', 'catboost', 'rnn', 'transformer'])
+
+    if model_type == 'lightgbm':
+        param = {
+            'objective': 'regression',
+            'metric': 'mse',
+            'num_leaves': trial.suggest_int('num_leaves', 31, 255),
+            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.1, log=True),
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+        }
+        model = lgb.LGBMRegressor(**param)
+
+    elif model_type == 'xgboost':
+        param = {
+            'objective': 'reg:squarederror',
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.1, log=True),
+            'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 1.0),
+        }
+        model = xgb.XGBRegressor(**param)
+
+    elif model_type == 'catboost':
+        param = {
+            'iterations': trial.suggest_int('iterations', 50, 500),
+            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.1, log=True),
+            'depth': trial.suggest_int('depth', 3, 10),
+        }
+        model = catb.CatBoostRegressor(**param, verbose=0)
+
+    elif model_type == 'rnn':
+        input_shape = (X_train.shape[1], 1)
+        rnn_model = create_rnn_model(input_shape)
+        X_train_rnn = X_train.values.reshape(-1, X_train.shape[1], 1)
+        X_test_rnn = X_test.values.reshape(-1, X_test.shape[1], 1)
+        rnn_model.fit(X_train_rnn, y_train, epochs=10, batch_size=32, verbose=0)
+        y_pred = rnn_model.predict(X_test_rnn)
+        mse = mean_squared_error(y_test, y_pred)
+        return mse
+
+    elif model_type == 'transformer':
+        input_shape = (X_train.shape[1], 1)
+        transformer_model = create_transformer_model(input_shape)
+        X_train_transformer = X_train.values.reshape(-1, X_train.shape[1], 1)
+        X_test_transformer = X_test.values.reshape(-1, X_test.shape[1], 1)
+        transformer_model.fit(X_train_transformer, y_train, epochs=10, batch_size=32, verbose=0)
+        y_pred = transformer_model.predict(X_test_transformer)
+        mse = mean_squared_error(y_test, y_pred)
+        return mse
+
+    # クロスバリデーション
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    mse_scores = cross_val_score(model, X_train, y_train, cv=kf, scoring='neg_mean_squared_error')
+    return np.mean(mse_scores)
+
+# Optunaによる最適化実行
+# Optunaによる最適化実行
+study = optuna.create_study(direction='minimize')
+study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=50)
+
+# 最適なハイパーパラメータとモデルを表示
+best_trial = study.best_trial
+print(f'Best trial: {best_trial}')
+
+# 最良のパラメータでアンサンブルモデルを構築
+best_model_type = best_trial.params['model_type']
+if best_model_type == 'lightgbm':
+    best_model = lgb.LGBMRegressor(**best_trial.params)
+elif best_model_type == 'xgboost':
+    best_model = xgb.XGBRegressor(**best_trial.params)
+elif best_model_type == 'catboost':
+    best_model = cb.CatBoostRegressor(**best_trial.params, verbose=0)
+
+# モデルの学習と予測
+best_model.fit(X_train, y_train)
+y_pred = best_model.predict(X_test)
+
+# 最終的な性能評価
+final_mse = mean_squared_error(y_test, y_pred)
+print(f'Final MSE: {final_mse}')
+
+# アンサンブルを作成
+models = [
+    ('lgb', lgb.LGBMRegressor(**best_trial.params)),
+    ('xgb', xgb.XGBRegressor(**best_trial.params)),
+    ('cat', cb.CatBoostRegressor(**best_trial.params, verbose=0)),
+    ('rnn', create_rnn_model((X_train.shape[1], 1))),
+    ('transformer', create_transformer_model((X_train.shape[1], 1)))
+]
+
+# アンサンブル学習
+ensemble = VotingRegressor(estimators=models)
+ensemble.fit(X_train, y_train)
+
+# アンサンブル予測
+ensemble_pred = ensemble.predict(X_test)
+ensemble_mse = mean_squared_error(y_test, ensemble_pred)
+print(f'Ensemble Model MSE: {ensemble_mse}')
+
 # ========================== バックテスト（超シンプル版） ==========================
 def run_backtest(df, model, FEATURES):
     initial_cash = 10000
@@ -440,16 +561,30 @@ def main():
     # --- 学習・評価 ---
     X_train, X_test, y_train, y_test = train_test_split(df[FEATURES], df['target'], test_size=0.2, random_state=42)
 
-    base_models = get_base_models(FEATURES)
-    ensemble_model = build_stacking(base_models)
+    # Optunaによる最適化実行
+    study = optuna.create_study(direction='minimize')
+    study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=50)
 
-    ensemble_model.fit(X_train, y_train)
-    preds = ensemble_model.predict(X_test)
-    acc = accuracy_score(y_test, preds)
-    print(f"🎯 テスト精度: {acc:.4f}")
+    # 最適なハイパーパラメータとモデルを表示
+    best_trial = study.best_trial
+    print(f'Best trial: {best_trial}')
 
-    # --- バックテスト ---
-    run_backtest(df, ensemble_model, FEATURES)
+    # 最良のパラメータでアンサンブルモデルを構築
+    best_model_type = best_trial.params['model_type']
+    if best_model_type == 'lightgbm':
+        best_model = lgb.LGBMRegressor(**best_trial.params)
+    elif best_model_type == 'xgboost':
+        best_model = xgb.XGBRegressor(**best_trial.params)
+    elif best_model_type == 'catboost':
+        best_model = catb.CatBoostRegressor(**best_trial.params, verbose=0)
+
+    # モデルの学習と予測
+    best_model.fit(X_train, y_train)
+    y_pred = best_model.predict(X_test)
+
+    # 最終的な性能評価
+    final_mse = mean_squared_error(y_test, y_pred)
+    print(f'Final MSE: {final_mse}')
 
 if __name__ == "__main__":
     main()
