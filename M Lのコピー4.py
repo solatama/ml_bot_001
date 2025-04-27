@@ -1,23 +1,21 @@
-import os
-import time
+# ========================== ライブラリ ==========================
 import numpy as np
 import pandas as pd
-from math import factorial
-import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 import talib
 import yfinance as yf
+
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import log_loss
-from sklearn.ensemble import RandomForestClassifier, StackingClassifier, VotingClassifier
-from sklearn.neural_network import MLPClassifier
-from scipy.stats import ttest_1samp
-import lightgbm as lgb
+from sklearn.ensemble import StackingClassifier, RandomForestClassifier
 import xgboost as xgb
-from catboost import CatBoostClassifier
-import optuna
-from optuna.pruners import MedianPruner
+import lightgbm as lgb
+import catboost as catb
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 # === 定数定義 ===
 TICKER = '9684.T'
@@ -30,24 +28,8 @@ STOP_LOSS = 0.02    # 固定パーセント損切りでの損失許容率（例:
 TAKE_PROFIT = 0.04  # 利確幅（例:4%）
 COMMISSION = 0.0005  # 手数料率（必要なら設定）
 SLIPPAGE = 0.0005    # スリッページ率（必要なら設定）
-SELECTED_MODELS = ['xgboost', 'randomforest', 'catboost', 'lightgbm'] #'lightgbm',
+SELECTED_MODELS = ['xgboost', 'randomforest', 'catboost', 'lightgbm']
 ENSEMBLE_TYPE = 'stacking'  # 'blending', 'stacking', 'voting_hard', 'voting_soft'
-
-# === LightGBM Sklearn Wrapper ===
-class LightGBMSklearnWrapper(BaseEstimator, ClassifierMixin):
-    def __init__(self, **params):
-        import lightgbm as lgb
-        self.model = lgb.LGBMClassifier(**params)
-
-    def fit(self, X, y):
-        self.model.fit(X, y)
-        return self
-
-    def predict(self, X):
-        return self.model.predict(X)
-
-    def predict_proba(self, X):
-        return self.model.predict_proba(X)
 
 # === データ取得 ===
 def fetch_data(ticker, start_date, end_date, interval):
@@ -92,148 +74,147 @@ def calc_features(df):
     hilo = (df['high'] + df['low']) / 2
     # 価格(hilo または close)を引いた後、価格(close)で割ることで標準化してるものあり
 
-    # ボリンジャーバンド
-    df['BBANDS_upperband'], df['BBANDS_middleband'], df['BBANDS_lowerband'] = talib.BBANDS(df['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0)
-    df['BBANDS_upperband'] = (df['BBANDS_upperband'] - hilo) / df['close']
-    df['BBANDS_middleband'] = (df['BBANDS_middleband'] - hilo) / df['close']
-    df['BBANDS_lowerband'] = (df['BBANDS_lowerband'] - hilo) / df['close']
+    # ボリンジャーバンドを計算して df に追加
+    df['BBANDS_upperband'], df['BBANDS_middleband'], df['BBANDS_lowerband'] = talib.BBANDS(
+        df['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0
+    )
 
-    # 移動平均
-    df['DEMA'] = (talib.DEMA(close_col, timeperiod=30) - hilo) / close_col
-    df['EMA'] = (talib.EMA(close_col, timeperiod=30) - hilo) / close_col
-    df['EMA_short'] = (talib.EMA(close_col, timeperiod=5) - hilo) / close_col
-    df['EMA_middle'] = (talib.EMA(close_col, timeperiod=20) - hilo) / close_col
-    df['EMA_long'] = (talib.EMA(close_col, timeperiod=40) - hilo) / close_col
-    df['HT_TRENDLINE'] = (talib.HT_TRENDLINE(close_col) - hilo) / close_col
-    df['KAMA'] = (talib.KAMA(close_col, timeperiod=30) - hilo) / close_col
-    df['MA'] = (talib.MA(close_col, timeperiod=30, matype=0) - hilo) / close_col
-    df['MIDPOINT'] = (talib.MIDPOINT(close_col, timeperiod=14) - hilo) / close_col
-    df['SMA'] = (talib.SMA(close_col, timeperiod=30) - hilo) / close_col
-    df['T3'] = (talib.T3(close_col, timeperiod=5, vfactor=0) - hilo) / close_col
-    df['HMA'] = talib.WMA(close_col, timeperiod=30)
-    df['TEMA'] = (talib.TEMA(close_col, timeperiod=30) - hilo) / close_col
-    df['TRIMA'] = (talib.TRIMA(close_col, timeperiod=30) - hilo) / close_col
-    df['WMA'] = (talib.WMA(close_col, timeperiod=30) - hilo) / close_col
+    new_features = {
+        # ボリンジャーバンド
+        'BBANDS_upperband': (df['BBANDS_upperband'] - hilo) / df['close'],
+        'BBANDS_middleband': (df['BBANDS_middleband'] - hilo) / df['close'],
+        'BBANDS_lowerband': (df['BBANDS_lowerband'] - hilo) / df['close'],
 
-    # MACD
-    df['MACD_macd'], df['MACD_macdsignal'], df['MACD_macdhist'] = talib.MACD(close_col, fastperiod=12, slowperiod=26, signalperiod=9) # Use close_col instead of close
-    df['MACD_macd'] /= close_col # Use close_col instead of close
-    df['MACD_macdsignal'] /= close_col # Use close_col instead of close
-    df['MACD_macdhist'] /= close_col # Use close_col instead of close
-    df['MACD_EXT'], df['MACD_SIGNAL_EXT'], df['MACD_HIST_EXT'] = talib.MACDEXT(close_col, fastperiod=12, slowperiod=26, signalperiod=9, fastmatype=0, slowmatype=0, signalmatype=0) # Use close_col instead of close
+        # 移動平均
+        'DEMA': (talib.DEMA(close_col, timeperiod=30) - hilo) / close_col,
+        'EMA': (talib.EMA(close_col, timeperiod=30) - hilo) / close_col,
+        'EMA_short': (talib.EMA(close_col, timeperiod=5) - hilo) / close_col,
+        'EMA_middle': (talib.EMA(close_col, timeperiod=20) - hilo) / close_col,
+        'EMA_long': (talib.EMA(close_col, timeperiod=40) - hilo) / close_col,
+        'HT_TRENDLINE': (talib.HT_TRENDLINE(close_col) - hilo) / close_col,
+        'KAMA': (talib.KAMA(close_col, timeperiod=30) - hilo) / close_col,
+        'MA': (talib.MA(close_col, timeperiod=30, matype=0) - hilo) / close_col,
+        'MIDPOINT': (talib.MIDPOINT(close_col, timeperiod=14) - hilo) / close_col,
+        'SMA': (talib.SMA(close_col, timeperiod=30) - hilo) / close_col,
+        'T3': (talib.T3(close_col, timeperiod=5, vfactor=0) - hilo) / close_col,
+        'HMA': talib.WMA(close_col, timeperiod=30),
+        'TEMA': (talib.TEMA(close_col, timeperiod=30) - hilo) / close_col,
+        'TRIMA': (talib.TRIMA(close_col, timeperiod=30) - hilo) / close_col,
+        'WMA': (talib.WMA(close_col, timeperiod=30) - hilo) / close_col,
 
-    # 線形回帰系
-    df['LINEARREG'] = (talib.LINEARREG(close_col, timeperiod=14) - close_col) / close_col # Use close_col instead of close
-    df['LINEARREG_SLOPE'] = talib.LINEARREG_SLOPE(close_col, timeperiod=14) / close_col # Use close_col instead of close
-    df['LINEARREG_ANGLE'] = talib.LINEARREG_ANGLE(close_col, timeperiod=14) # Use close_col instead of close
-    df['LINEARREG_INTERCEPT'] = (talib.LINEARREG_INTERCEPT(close_col, timeperiod=14) - close_col) / close_col # Use close_col instead of close
+        # MACD
+        'MACD_macd': talib.MACD(close_col, fastperiod=12, slowperiod=26, signalperiod=9)[0] / close_col,
+        'MACD_macdsignal': talib.MACD(close_col, fastperiod=12, slowperiod=26, signalperiod=9)[1] / close_col,
+        'MACD_macdhist': talib.MACD(close_col, fastperiod=12, slowperiod=26, signalperiod=9)[2] / close_col,
 
-    # AD系
-    df['AD'] = talib.AD(high_col, low_col, close_col, volume) / close_col # Use high_col, low_col, close_col instead of high, low, close
-    df['ADX'] = talib.ADX(high_col, low_col, close_col, timeperiod=14) # Use high_col, low_col, close_col instead of high, low, close
-    df['ADXR'] = talib.ADXR(high_col, low_col, close_col, timeperiod=14) # Use high_col, low_col, close_col instead of high, low, close
-    df['ADOSC'] = talib.ADOSC(high_col, low_col, close_col, volume, fastperiod=3, slowperiod=10) / close_col # Use high_col, low_col, close_col instead of high, low, close
-    df['OBV'] = talib.OBV(close_col, volume) / close_col # Use close_col instead of close
+        # 線形回帰系
+        'LINEARREG': (talib.LINEARREG(close_col, timeperiod=14) - close_col) / close_col,
+        'LINEARREG_SLOPE': talib.LINEARREG_SLOPE(close_col, timeperiod=14) / close_col,
+        'LINEARREG_ANGLE': talib.LINEARREG_ANGLE(close_col, timeperiod=14),
+        'LINEARREG_INTERCEPT': (talib.LINEARREG_INTERCEPT(close_col, timeperiod=14) - close_col) / close_col,
 
-    # オシレーター系
-    df['APO'] = talib.APO(close_col, fastperiod=12, slowperiod=26, matype=0) / close_col  # Changed close to close_col
-    df['BOP'] = talib.BOP(open_col, high_col, low_col, close_col)  # Changed open, high, low, close to their respective _col variables
-    df['CCI'] = talib.CCI(high_col, low_col, close_col, timeperiod=14)  # Changed high, low, close to their respective _col variables
-    df['DX'] = talib.DX(high_col, low_col, close_col, timeperiod=14)  # Changed high, low, close to their respective _col variables
-    df['MFI'] = talib.MFI(high_col, low_col, close_col, volume, timeperiod=14)  # Changed high, low, close to their respective _col variables
-    df['MINUS_DI'] = talib.MINUS_DI(high_col, low_col, close_col, timeperiod=14)  # Changed high, low, close to their respective _col variables
-    df['PLUS_DI'] = talib.PLUS_DI(high_col, low_col, close_col, timeperiod=14)  # Changed high, low, close to their respective _col variables
-    df['MOM'] = talib.MOM(close_col, timeperiod=10) / close_col  # Changed close to close_col
-    df['RSI'] = talib.RSI(close_col, timeperiod=14)  # Changed close to close_col
-    df['TRIX'] = talib.TRIX(close_col, timeperiod=30)  # Changed close to close_col
-    df['ULTOSC'] = talib.ULTOSC(high_col, low_col, close_col, timeperiod1=7, timeperiod2=14, timeperiod3=28)  # Changed high, low, close to their respective _col variables
-    df['WILLR'] = talib.WILLR(high_col, low_col, close_col, timeperiod=14)  # Changed high, low, close to their respective _col variables
-    df['SAR'] = talib.SAR(high_col, low_col, acceleration=0.02, maximum=0.2)  # Changed high, low to their respective _col variables
+        # AD系
+        'AD': talib.AD(high_col, low_col, close_col, volume) / close_col,
+        'ADX': talib.ADX(high_col, low_col, close_col, timeperiod=14),
+        'ADXR': talib.ADXR(high_col, low_col, close_col, timeperiod=14),
+        'ADOSC': talib.ADOSC(high_col, low_col, close_col, volume, fastperiod=3, slowperiod=10) / close_col,
+        'OBV': talib.OBV(close_col, volume) / close_col,
 
-    # ストキャスティクス
-    df['STOCH_slowk'], df['STOCH_slowd'] = talib.STOCH(high_col, low_col, close_col, fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0) # Changed high, low, close to high_col, low_col, close_col
-    df['STOCHF_fastk'], df['STOCHF_fastd'] = talib.STOCHF(high_col, low_col, close_col, fastk_period=5, fastd_period=3, fastd_matype=0) # Changed high, low, close to high_col, low_col, close_col
-    df['STOCHRSI_fastk'], df['STOCHRSI_fastd'] = talib.STOCHRSI(close_col, timeperiod=14, fastk_period=5, fastd_period=3, fastd_matype=0) # Changed close to close_col
+        # オシレーター系
+        'APO': talib.APO(close_col, fastperiod=12, slowperiod=26, matype=0) / close_col,
+        'BOP': talib.BOP(open_col, high_col, low_col, close_col),
+        'CCI': talib.CCI(high_col, low_col, close_col, timeperiod=14),
+        'DX': talib.DX(high_col, low_col, close_col, timeperiod=14),
+        'MFI': talib.MFI(high_col, low_col, close_col, volume, timeperiod=14),
+        'MINUS_DI': talib.MINUS_DI(high_col, low_col, close_col, timeperiod=14),
+        'PLUS_DI': talib.PLUS_DI(high_col, low_col, close_col, timeperiod=14),
+        'MOM': talib.MOM(close_col, timeperiod=10) / close_col,
+        'RSI': talib.RSI(close_col, timeperiod=14),
+        'TRIX': talib.TRIX(close_col, timeperiod=30),
+        'ULTOSC': talib.ULTOSC(high_col, low_col, close_col, timeperiod1=7, timeperiod2=14, timeperiod3=28),
+        'WILLR': talib.WILLR(high_col, low_col, close_col, timeperiod=14),
+        'SAR': talib.SAR(high_col, low_col, acceleration=0.02, maximum=0.2),
 
-    # ボラティリティ系
-    df['MINUS_DM'] = talib.MINUS_DM(high_col, low_col, timeperiod=14) / close_col # Changed high, low, close to high_col, low_col, close_col
-    df['PLUS_DM'] = talib.PLUS_DM(high_col, low_col, timeperiod=14) / close_col # Changed high, low, close to high_col, low_col, close_col
-    df['STDDEV'] = talib.STDDEV(close_col, timeperiod=5, nbdev=1) # Changed close to close_col
-    df['TRANGE'] = talib.TRANGE(high_col, low_col, close_col) # Changed high, low, close to high_col, low_col, close_col
-    df['VAR'] = talib.VAR(close_col, timeperiod=5, nbdev=1) # Changed close to close_col
-    df['ATR'] = talib.ATR(high_col, low_col, close_col, timeperiod=14) # Changed high, low, close to high_col, low_col, close_col
-    df['NATR'] = talib.NATR(high_col, low_col, close_col, timeperiod=14) # Changed high, low, close to high_col, low_col, close_col
-    df['VOLATILITY_index'] = df['ATR'] / df['STDDEV']
+        # ボラティリティ系
+        'MINUS_DM': talib.MINUS_DM(high_col, low_col, timeperiod=14) / close_col,
+        'PLUS_DM': talib.PLUS_DM(high_col, low_col, timeperiod=14) / close_col,
+        'STDDEV': talib.STDDEV(close_col, timeperiod=5, nbdev=1),
+        'TRANGE': talib.TRANGE(high_col, low_col, close_col),
+        'VAR': talib.VAR(close_col, timeperiod=5, nbdev=1),
+        'ATR': talib.ATR(high_col, low_col, close_col, timeperiod=14),
+        'NATR': talib.NATR(high_col, low_col, close_col, timeperiod=14),
+        'VOLATILITY_index': talib.ATR(high_col, low_col, close_col, timeperiod=14) / talib.STDDEV(close_col, timeperiod=5, nbdev=1),
 
-    # ヒルベルト変換
-    df['HT_DCPERIOD'] = talib.HT_DCPERIOD(close_col) # Changed close to close_col
-    df['HT_DCPHASE'] = talib.HT_DCPHASE(close_col) # Changed close to close_col
-    df['HT_PHASOR_inphase'], df['HT_PHASOR_quadrature'] = talib.HT_PHASOR(close_col) # Changed close to close_col
-    df['HT_PHASOR_inphase'] /= close_col # Changed close to close_col
-    df['HT_PHASOR_quadrature'] /= close_col # Changed close to close_col
-    df['HT_SINE_sine'], df['HT_SINE_leadsine'] = talib.HT_SINE(close_col) # Changed close to close_col
-    df['HT_SINE_sine'] /= close_col # Changed close to close_col
-    df['HT_SINE_leadsine'] /= close_col # Changed close to close_col
-    df['HT_TRENDMODE'] = talib.HT_TRENDMODE(close_col) # Changed close to close_col
+        # ストキャスティクス
+        'STOCH_slowk': talib.STOCH(high_col, low_col, close_col, fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)[0],
+        'STOCH_slowd': talib.STOCH(high_col, low_col, close_col, fastk_period=5, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)[1],
+        'STOCHF_fastk': talib.STOCHF(high_col, low_col, close_col, fastk_period=5, fastd_period=3, fastd_matype=0)[0],
+        'STOCHF_fastd': talib.STOCHF(high_col, low_col, close_col, fastk_period=5, fastd_period=3, fastd_matype=0)[1],
+        'STOCHRSI_fastk': talib.STOCHRSI(close_col, timeperiod=14, fastk_period=5, fastd_period=3, fastd_matype=0)[0],
+        'STOCHRSI_fastd': talib.STOCHRSI(close_col, timeperiod=14, fastk_period=5, fastd_period=3, fastd_matype=0)[1],
 
-    # その他
-    df['ROC'] = talib.ROC(close_col, timeperiod=10) / close_col # Changed close to close_col
-    df['STDDEV'] = talib.STDDEV(close_col, timeperiod=5, nbdev=1) / close_col # Changed close to close_col
-    df['TRANGE'] = talib.TRANGE(high_col, low_col, close_col) / close_col # Changed high, low, close to high_col, low_col, close_col
-    df['AROON_aroondown'], df['AROON_aroonup'] = talib.AROON(high_col, low_col, timeperiod=14) # Changed high, low to high_col, low_col
-    df['AROONOSC'] = talib.AROONOSC(high_col, low_col, timeperiod=14) # Changed high, low to high_col, low_col
-    df['BETA'] = talib.BETA(high_col, low_col, timeperiod=5) # Changed high, low to high_col, low_col
-    df['CORREL'] = talib.CORREL(high_col, low_col, timeperiod=30) # Changed high, low to high_col, low_col
-    df['Price_ratio'] = df['close'] / df['close'].shift(1)  # Changed df[close_col] to df['close']
-    df['HIGH_ratio'] = df['high'] / df['high'].shift(1)  # Changed df[high_col] to df['high']
-    df['LOW_ratio'] = df['low'] / df['low'].shift(1)  # Changed df[low_col] to df['low']
+        # ヒルベルト変換
+        'HT_DCPERIOD': talib.HT_DCPERIOD(close_col),
+        'HT_DCPHASE': talib.HT_DCPHASE(close_col),
+        'HT_PHASOR_inphase': talib.HT_PHASOR(close_col)[0] / close_col,
+        'HT_PHASOR_quadrature': talib.HT_PHASOR(close_col)[1] / close_col,
+        'HT_SINE_sine': talib.HT_SINE(close_col)[0] / close_col,
+        'HT_SINE_leadsine': talib.HT_SINE(close_col)[1] / close_col,
+        'HT_TRENDMODE': talib.HT_TRENDMODE(close_col),
 
-    # Lag特徴量
-    df['CLOSE_lag_1'] = df['close'].shift(1)  # 1日遅れの終値 # Changed df[close_col] to df['close']
-    df['CLOSE_lag_5'] = df['close'].shift(5)  # 5日遅れの終値 # Changed df[close_col] to df['close']
-    df['MOVIENG_avg_5'] = df['close'].rolling(window=5).mean()  # 5日移動平均 # Changed df[close_col] to df['close']
-    # 周期性の特徴量
-    df['DAY_of_week'] = df.index.dayofweek  # 曜日（0=月曜日, 6=日曜日）
-    df['IS_weekend'] = (df['DAY_of_week'] >= 5).astype(int)  # 週末かどうか
-    df['MONTH'] = df.index.month  # 月（1〜12）
-    df['SIN_day'] = np.sin(2 * np.pi * df['DAY_of_week'] / 7)  # 日周期
-    df['COS_day'] = np.cos(2 * np.pi * df['DAY_of_week'] / 7)  # 日周期
-    df['SIN_month'] = np.sin(2 * np.pi * df['MONTH'] / 12)  # 月周期
-    df['COS_month'] = np.cos(2 * np.pi * df['MONTH'] / 12)  # 月周期
+        # その他
+        'ROC': talib.ROC(close_col, timeperiod=10) / close_col,
+        'STDDEV': talib.STDDEV(close_col, timeperiod=5, nbdev=1) / close_col,
+        'TRANGE': talib.TRANGE(high_col, low_col, close_col) / close_col,
+        'AROON_aroondown': talib.AROON(high_col, low_col, timeperiod=14)[0],
+        'AROON_aroonup': talib.AROON(high_col, low_col, timeperiod=14)[1],
+        'AROONOSC': talib.AROONOSC(high_col, low_col, timeperiod=14),
+        'BETA': talib.BETA(high_col, low_col, timeperiod=5),
+        'CORREL': talib.CORREL(high_col, low_col, timeperiod=30),
+        'Price_ratio': df['close'] / df['close'].shift(1),
+        'HIGH_ratio': df['high'] / df['high'].shift(1),
+        'LOW_ratio': df['low'] / df['low'].shift(1),
 
-    # リターン系
-    df['log_return'] = np.log(df['close'] / df['close'].shift(1))
-    df['return_1d'] = df['close'].pct_change(1)
-    df['return_5d'] = df['close'].pct_change(5)
-    df['return_10d'] = df['close'].pct_change(10)
-    df['return_20d'] = df['close'].pct_change(20)
+        # Lag特徴量
+        'CLOSE_lag_1': df['close'].shift(1),
+        'CLOSE_lag_5': df['close'].shift(5),
+        'MOVIENG_avg_5': df['close'].rolling(window=5).mean(),
 
-    df['return_ma_5'] = df['return_1d'].rolling(window=5).mean()
-    df['return_ma_10'] = df['return_1d'].rolling(window=10).mean()
+        # 周期性の特徴量
+        'DAY_of_week': df.index.dayofweek,
+        'IS_weekend': (df.index.dayofweek >= 5).astype(int),
+        'MONTH': df.index.month,
+        'SIN_day': np.sin(2 * np.pi * df.index.dayofweek / 7),
+        'COS_day': np.cos(2 * np.pi * df.index.dayofweek / 7),
+        'SIN_month': np.sin(2 * np.pi * df.index.month / 12),
+        'COS_month': np.cos(2 * np.pi * df.index.month / 12),
 
-    df['volatility_5'] = df['close'].rolling(window=5).std()
-    df['volatility_10'] = df['close'].rolling(window=10).std()
+        # リターン系
+        'log_return': np.log(df['close'] / df['close'].shift(1)),
+        'return_1d': df['close'].pct_change(1),
+        'return_5d': df['close'].pct_change(5),
+        'return_10d': df['close'].pct_change(10),
+        'return_20d': df['close'].pct_change(20),
+        'return_ma_5': df['close'].pct_change(1).rolling(window=5).mean(),
+        'return_ma_10': df['close'].pct_change(1).rolling(window=10).mean(),
+        'volatility_5': df['close'].rolling(window=5).std(),
+        'volatility_10': df['close'].rolling(window=10).std(),
+        'range': df['high'] - df['low'],
+        'volume_change': df['volume'].pct_change(1),
 
-    df['range'] = df['high'] - df['low']
+        # トレンド・モメンタム系
+        'ma_5': df['close'].rolling(window=5).mean(),
+        'ma_25': df['close'].rolling(window=25).mean(),
+        'ma_75': df['close'].rolling(window=75).mean(),
+        'ma_deviation_5': df['close'] / df['close'].rolling(window=5).mean() - 1,
+        'ma_deviation_25': df['close'] / df['close'].rolling(window=25).mean() - 1,
+        'ma_deviation_75': df['close'] / df['close'].rolling(window=75).mean() - 1,
+        'momentum_5': df['close'] - df['close'].shift(5),
+        'momentum_10': df['close'] - df['close'].shift(10),
+        'momentum_20': df['close'] - df['close'].shift(20),
+    }
 
-    df['volume_change'] = df['volume'].pct_change(1)
-
-    # トレンド・モメンタム系
-    df['ma_5'] = df['close'].rolling(window=5).mean()
-    df['ma_25'] = df['close'].rolling(window=25).mean()
-    df['ma_75'] = df['close'].rolling(window=75).mean()
-
-    df['ma_deviation_5'] = df['close'] / df['ma_5'] - 1
-    df['ma_deviation_25'] = df['close'] / df['ma_25'] - 1
-    df['ma_deviation_75'] = df['close'] / df['ma_75'] - 1
-
-    # モメンタム（n日前比）
-    df['momentum_5'] = df['close'] - df['close'].shift(5)
-    df['momentum_10'] = df['close'] - df['close'].shift(10)
-    df['momentum_20'] = df['close'] - df['close'].shift(20)
-
-    # --- ローソク足パターン（50種類）---
-    # 値は +100: 強気シグナル, -100: 弱気シグナル, 0: シグナルなし
+    # ローソク足パターンを辞書に追加
     candlestick_patterns = {
         'CDL2CROWS': talib.CDL2CROWS,
         'CDL3BLACKCROWS': talib.CDL3BLACKCROWS,
@@ -287,403 +268,188 @@ def calc_features(df):
         'CDLSHOOTINGSTAR': talib.CDLSHOOTINGSTAR,
     }
 
-    # パターンを一括で計算して DataFrame に追加
-    for name, func in candlestick_patterns.items():
-        df[name] = func(open_col, high_col, low_col, close_col)
+    # 一括で DataFrame に追加
+    df = pd.concat([df, pd.DataFrame(new_features)], axis=1)
 
     # 例: 翌日の終値が当日の終値より高ければ1、そうでなければ0
-    df['long_target'] = (df['close'].shift(-1) > df['close']).astype(int)
+    df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
 
     df.dropna(inplace=True)
     return df
 
-# === 相関係数による特徴量削除関数（改良版） ===
-# === 相関係数による特徴量削除関数（さらにスマート改良版） ===
+# ========================== 相関除去関数 ==========================
 def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
-    """
-    高い相関を持つ特徴量を削除する（open, high, low, close, volumeはデフォルトで守る）。
-    :param df: 特徴量データフレーム
-    :param threshold: 相関係数の閾値
-    :param exclude_columns: 削除対象から除外する列のリスト（デフォルトでOHLCVを除外）
-    :return: 相関が高くない特徴量を持つデータフレーム
-    """
     if exclude_columns is None:
         exclude_columns = ['open', 'high', 'low', 'close', 'volume']
-
-    print(f"🔍 相関除去前の特徴量数: {df.shape[1]}列")
-
-    # 相関行列を計算
     corr_matrix = df.corr().abs()
     upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-
-    # 削除対象の列を特定（除外リストに含まれる列は削除しない）
-    to_drop = [
-        column for column in upper_triangle.columns
-        if any(upper_triangle[column] > threshold) and column not in exclude_columns
-    ]
-
+    to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > threshold) and column not in exclude_columns]
     print(f"🛠️ 削除された高相関特徴量: {to_drop}")
+    return df.drop(columns=to_drop)
 
-    df_dropped = df.drop(columns=to_drop)
+# ========================== PyTorch用ラッパー ==========================
+class BaseTorchWrapper(BaseEstimator, ClassifierMixin):
+    def __init__(self, model_class, input_dim, hidden_dim=64, num_layers=2, epochs=20, batch_size=32, lr=0.001, device=None):
+        self.model_class = model_class
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.classes_ = None  # クラス属性を初期化
 
-    print(f"✅ 相関除去後の特徴量数: {df_dropped.shape[1]}列")
+    def fit(self, X, y):
+        # クラス属性を設定
+        self.classes_ = np.unique(y)
 
-    return df_dropped
+        X = torch.tensor(X.values, dtype=torch.float32) if isinstance(X, pd.DataFrame) else torch.tensor(X, dtype=torch.float32)
+        y = torch.tensor(y.values, dtype=torch.float32).unsqueeze(1) if isinstance(y, pd.Series) else torch.tensor(y, dtype=torch.float32).unsqueeze(1)
 
-# === LightGBM重要度で上位特徴量を選択 ===
-def select_top_features_with_lightgbm(df, target, top_n=10):
-    """
-    LightGBMの重要度を用いて上位の特徴量を選択する。
-    :param df: 特徴量データフレーム
-    :param target: ターゲット列名
-    :param top_n: 選択する特徴量の数
-    :return: 上位特徴量のリスト
-    """
-    X = df.drop(columns=[target])
-    y = df[target]
+        dataset = torch.utils.data.TensorDataset(X, y)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        self.model = self.model_class(self.input_dim, self.hidden_dim, self.num_layers).to(self.device)
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
-    model = lgb.LGBMClassifier()
-    model.fit(X, y)
+        self.model.train()
+        for epoch in range(self.epochs):
+            for batch_X, batch_y in loader:
+                batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
+                optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+        return self
 
-    feature_importances = pd.DataFrame({
-        'feature': X.columns,
-        'importance': model.feature_importances_
-    }).sort_values(by='importance', ascending=False)
+    def predict_proba(self, X):
+        X = torch.tensor(X.values, dtype=torch.float32).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(X)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+        return np.hstack([1 - probs, probs])
 
-    top_features = feature_importances.head(top_n)['feature'].tolist()
-    print(f"🌟 LightGBMで選ばれた上位 {top_n} 特徴量: {top_features}")
-    return top_features
+    def predict(self, X):
+        probs = self.predict_proba(X)[:, 1]
+        return (probs > 0.5).astype(int)
 
-# === モデル作成 ===
-def create_model(model_type, params=None):
-    if model_type == 'lightgbm':
-        return lgb.LGBMClassifier(**params)
-    elif model_type == 'xgboost':
-        return xgb.XGBClassifier(**params)
-    elif model_type == 'catboost':
-        return CatBoostClassifier(verbose=0, **params)
-    elif model_type == 'randomforest':
-        return RandomForestClassifier(**params)
-    elif model_type == 'mlp':
-        return MLPClassifier(max_iter=500, **params)
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}")
+# ========================== モデル定義 (RNN/Transformer) ==========================
+class SimpleRNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers):
+        super(SimpleRNN, self).__init__()
+        self.rnn = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
 
-# === Optunaによるハイパーパラメータ最適化 ===
-def optimize_hyperparameters(df, model_type):
-    def objective(trial):
-        # モデルごとに異なるハイパーパラメータを設定
-        if model_type == 'lightgbm':
-            params = {
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
-                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-            }
-        elif model_type == 'xgboost':
-            params = {
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
-                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-                'gamma': trial.suggest_float('gamma', 0, 5),
-            }
-        elif model_type == 'catboost':
-            params = {
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
-                'depth': trial.suggest_int('depth', 3, 10),
-                'iterations': trial.suggest_int('iterations', 100, 1000),
-            }
-        elif model_type == 'randomforest':
-            params = {
-                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-                'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
-            }
-        else:
-            raise ValueError(f"Unsupported model type for optimization: {model_type}")
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        out, _ = self.rnn(x)
+        out = self.fc(out[:, -1, :])
+        return out
 
-        # モデルを作成してスコアを計算
-        model = create_model(model_type, params)
-        scores = []
-        tscv = TimeSeriesSplit(n_splits=3)
-        for train_idx, test_idx in tscv.split(df):
-            X_train, X_test = df.iloc[train_idx][FEATURES], df.iloc[test_idx][FEATURES]
-            y_train, y_test = df.iloc[train_idx]['long_target'], df.iloc[test_idx]['long_target']
-            model.fit(X_train, y_train)
-            preds = model.predict_proba(X_test)[:, 1]
-            scores.append(log_loss(y_test, preds))
-        return np.mean(scores)
+class SimpleTransformer(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers):
+        super(SimpleTransformer, self).__init__()
 
-    # Optunaで最適化
-    study = optuna.create_study(direction='minimize', pruner=MedianPruner())
-    study.optimize(objective, n_trials=30)
-    return study.best_params
+        # nhead を input_dim に合わせて調整
+        nhead = 4
+        if input_dim % nhead != 0:
+            nhead = 1  # 必要に応じて nhead を 1 に設定
 
-# === 損切り・利確判定関数 ===
-def should_exit(position, entry_price, current_price, high, low, sar, stop_loss_mode):
-    """
-    損切り・利確判定をする関数
-    """
-    if position != 'long':
-        return False
+        encoder_layer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=nhead)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(input_dim, 1)
 
-    # モード1: 固定パーセント
-    if stop_loss_mode == 1:
-        stop_loss_price = entry_price * (1 - STOP_LOSS)
-        take_profit_price = entry_price * (1 + TAKE_PROFIT)
-        if low <= stop_loss_price or high >= take_profit_price:
-            return True
+    def forward(self, x):
+        x = x.unsqueeze(1)
+        out = self.transformer(x)
+        out = self.fc(out[:, -1, :])
+        return out
 
-    # モード2: パラボリックSAR
-    elif stop_loss_mode == 2:
-        if sar is not None and low < sar:
-            return True
-
-    # モード3: 直近安値割れ
-    elif stop_loss_mode == 3:
-        if low < entry_price * 0.98:  # 仮に直近2%下で損切り
-            return True
-
-    return False
-
-def p_mean_test(returns, period=14, alpha=0.03):
-    """
-    p平均法によるストラテジー有意性検定
-    Parameters:
-        returns: リターンの時系列 (1次元 array-like)
-        period: 検定に使う期間の長さ（日数）
-        alpha: 有意水準 (例: 0.03)
-    Returns:
-        mean_p: p値の平均
-        significant: 有意かどうか（mean_p < alpha）
-        error_rate: エラー率の近似値
-    """
-    returns = np.array(returns)
-    n = len(returns) // period
-    p_values = []
-
-    for i in range(n):
-        chunk = returns[i*period : (i+1)*period]
-        if len(chunk) < 2:  # t検定には2点以上必要
-            continue
-        _, p = ttest_1samp(chunk, popmean=0, alternative='greater')
-        p_values.append(p)
-
-    if not p_values:
-        raise ValueError("有効な期間がありません。データが少なすぎます。")
-
-    mean_p = np.mean(p_values)
-    significant = mean_p < alpha
-
-    # エラー率の近似 (mean(p)*N)^N / N!
-    N = len(p_values)
-    error_rate = (mean_p * N)**N / factorial(N)
-
-    return mean_p, significant, error_rate
-
-# === バックテスト ===
-from scipy.special import softmax
-
-# ストラテジー別にモデルを適用し、Softmax重みで統合した予測を用いたバックテスト
-# === バックテスト関数 ===
-def run_backtest(df, model, features):
-    print("🧪 df[features].shape in backtest:", df[features].shape)
-    print("🧪 features list:", features)
-    print("🧪 first few rows of df[features]:\n", df[features].head())
-
-    # トレーニング時の特徴量を使用
-    predictions = model.predict(df[features])
-    position = None
-    entry_price = 0
-    pnl = []
-    trade_log = []
-    equity_curve = [1.0]  # 資産曲線（初期資産を1.0とする）
-
-    df_selected = remove_highly_correlated_features(df)
-
-    for i, pred in enumerate(predictions):
-        close_price = df.iloc[i]['close']
-        high_price = df.iloc[i]['high']
-        low_price = df.iloc[i]['low']
-        sar = df.iloc[i]['SAR'] if 'SAR' in df.columns else None  # SARが存在する場合のみ取得
-
-        # エントリー条件
-        if position is None and pred > 0.5:
-            position = 'long'
-            entry_price = close_price
-            trade_log.append(('BUY', close_price))
-
-        # エグジット条件
-        if position == 'long':
-            if should_exit(position, entry_price, close_price, high_price, low_price, sar, STOP_LOSS_MODE):
-                profit = close_price - entry_price - (close_price * COMMISSION + close_price * SLIPPAGE)
-                pnl.append(profit)
-                position = None
-                trade_log.append(('SELL', close_price))
-                # 資産曲線を更新
-                equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
-
-    # シャープレシオの計算
-    daily_returns = np.diff(equity_curve) / equity_curve[:-1]
-    sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252) if len(daily_returns) > 1 else 0
-
-    # 最大ドローダウンの計算
-    equity_curve_array = np.array(equity_curve)
-    drawdown = equity_curve_array / np.maximum.accumulate(equity_curve_array) - 1
-    max_drawdown = drawdown.min()
-
-    # 総損益と勝率
-    total_pnl = np.sum(pnl)
-    win_rate = np.mean(np.array(pnl) > 0) if pnl else 0
-
-    # P平均法の計算
-    p_average = np.mean(pnl) if pnl else 0
-
-    # p平均法による有意性検定
-    if len(daily_returns) >= 14:
-        try:
-            mean_p, significant, error_rate = p_mean_test(daily_returns, period=14, alpha=0.03)
-        except ValueError as e:
-            mean_p, significant, error_rate = None, None, None
-            print(f"⚠️ p平均法検定エラー: {e}")
-    else:
-        mean_p, significant, error_rate = None, None, None
-        print("⚠️ p平均法検定をスキップ: データが少なすぎます。")
-
-    # 結果を辞書形式で返す
-    return {
-        "total_pnl": total_pnl,
-        "win_rate": win_rate,
-        "sharpe_ratio": sharpe_ratio,
-        "max_drawdown": max_drawdown,
-        "p_average": p_average,
-        "equity_curve": equity_curve,
-        "mean_p": mean_p,
-        "significant": significant,
-        "error_rate": error_rate,
+# ========================== Baseモデル作成 ==========================
+def get_base_models(FEATURES):
+    models = {
+        'lgb': lgb.LGBMClassifier(random_state=42),
+        'xgb': xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42),
+        'cat': catb.CatBoostClassifier(verbose=0, random_state=42),
+        'rf': RandomForestClassifier(random_state=42),
+        'rnn': BaseTorchWrapper(SimpleRNN, input_dim=len(FEATURES), epochs=30),
+        'transformer': BaseTorchWrapper(SimpleTransformer, input_dim=len(FEATURES), epochs=30)
     }
+    return models
 
-def run_walk_forward_backtest(df, model, features, n_splits=5):
-    """
-    ウォークフォワード分析を実行する。
-    :param df: データフレーム
-    :param model: モデル
-    :param features: 使用する特徴量のリスト
-    :param n_splits: ウォークフォワードの分割数
-    :return: 各期間のバックテスト結果のリスト
-    """
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    results = []
+# ========================== Stackingモデル作成 ==========================
+def build_stacking(models):
+    estimators = [(name, model) for name, model in models.items()]
+    stack_model = StackingClassifier(estimators=estimators, final_estimator=lgb.LGBMClassifier())
+    return stack_model
 
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(df)):
-        print(f"=== ウォークフォワード期間 {fold + 1}/{n_splits} ===")
+# ========================== バックテスト（超シンプル版） ==========================
+def run_backtest(df, model, FEATURES):
+    initial_cash = 10000
+    cash = initial_cash
+    position = 0
 
-        # トレーニングデータとテストデータに分割
-        train_df = df.iloc[train_idx]
-        test_df = df.iloc[test_idx]
+    # 修正: df[FEATURES] をそのまま渡す
+    preds = model.predict(df[FEATURES])
+    df['preds'] = preds
 
-        # モデルのトレーニング
-        model.fit(train_df[features], train_df['long_target'])
+    for i in range(1, len(df)):
+        close_price = df['close'].iloc[i]
 
-        # テストデータでバックテストを実行
-        backtest_result = run_backtest(test_df, model, features)
-        results.append(backtest_result)
+        # Buy Signal
+        if df['preds'].iloc[i-1] == 1 and cash > 0:
+            position = cash / close_price
+            cash = 0
+            print(f"🔼 Buy at {close_price:.2f}, Position: {position:.4f}")
 
-        # 各期間の結果を出力
-        print(f"期間 {fold + 1} の結果:")
-        print(f"総損益: {backtest_result['total_pnl']:.2f}")
-        print(f"勝率: {backtest_result['win_rate']:.2%}")
-        print(f"シャープレシオ: {backtest_result['sharpe_ratio']:.2f}")
-        print(f"最大ドローダウン: {backtest_result['max_drawdown']:.2%}")
-        print(f"P平均法: {backtest_result['p_average']:.2f}")
+        # Sell Signal
+        elif df['preds'].iloc[i-1] == 0 and position > 0:
+            cash = position * close_price
+            position = 0
+            print(f"🔽 Sell at {close_price:.2f}, Cash: {cash:.2f}")
 
-    return results
+    # 最終資産を計算
+    final_value = cash + position * df['close'].iloc[-1]
+    total_return = (final_value / initial_cash) - 1
+    print(f"📈 最終資産: {final_value:.2f}円（リターン: {total_return*100:.2f}%）")
+    return final_value
 
-# === メイン処理 ===
+# ========================== main ==========================
 def main():
-    start_time = time.time()
-
-    # データ取得
+    # --- データ取得 ---
     df = fetch_data(TICKER, START_DATE, END_DATE, INTERVAL)
     if df is None:
         print("データが取得できませんでした。処理を終了します。")
         return
 
-    print("[DEBUG] fetch_data 後のデータフレーム:")
-    print(df.head())
-    print("[DEBUG] fetch_data 後の列名:", df.columns.tolist())
-
-    # 特徴量生成
+    # --- 特徴量生成 ---
     df = calc_features(df)
 
-    print("🔍 特徴量生成後の列:", df.columns.tolist())
+    # --- 相関除去 ---
+    print(f"🔍 相関除去前の特徴量数: {df.shape[1]}列")
+    df = remove_highly_correlated_features(df)
+    print(f"✅ 相関除去後の特徴量数: {df.shape[1]}列")
 
-    # 相関係数による特徴量削除
-    df = remove_highly_correlated_features(df, exclude_columns=['close'])
+    # --- 特徴量定義 ---
+    FEATURES = [col for col in df.columns if col not in ['target']]
 
-    print("🔍 高相関特徴量削除後の列:", df.columns.tolist())
+    # --- 学習・評価 ---
+    X_train, X_test, y_train, y_test = train_test_split(df[FEATURES], df['target'], test_size=0.2, random_state=42)
 
-    # 目的変数を除いた全列名をFEATURESに
-    FEATURES = [col for col in df.columns if col != 'long_target']
+    base_models = get_base_models(FEATURES)
+    ensemble_model = build_stacking(base_models)
 
-    # LightGBMで上位特徴量を選択
-    top_features = select_top_features_with_lightgbm(df, target='long_target', top_n=10)
+    ensemble_model.fit(X_train, y_train)
+    preds = ensemble_model.predict(X_test)
+    acc = accuracy_score(y_test, preds)
+    print(f"🎯 テスト精度: {acc:.4f}")
 
-    # FEATURES を top_features に設定
-    FEATURES = top_features
-    print("🔍 使用する特徴量:", FEATURES)
-
-    # スケーリング
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    df['close_scaled'] = scaler.fit_transform(df[['close']])
-
-    # モデル最適化
-    best_params_dict = {model: optimize_hyperparameters(df, model) for model in SELECTED_MODELS}
-
-    # モデル作成
-    base_models = [(name, create_model(name, best_params_dict[name])) for name in SELECTED_MODELS]
-
-    # 各モデルのトレーニング
-    for name, model in base_models:
-        model.fit(df[FEATURES], df['long_target'])
-
-    # アンサンブルモデル
-    if ENSEMBLE_TYPE == 'stacking':
-        ensemble_model = StackingClassifier(estimators=base_models, final_estimator=MLPClassifier(max_iter=500))
-    elif ENSEMBLE_TYPE == 'voting_hard':
-        ensemble_model = VotingClassifier(estimators=base_models, voting='hard')
-    elif ENSEMBLE_TYPE == 'voting_soft':
-        ensemble_model = VotingClassifier(estimators=base_models, voting='soft')
-    else:
-        raise ValueError(f"Unsupported ensemble type: {ENSEMBLE_TYPE}")
-
-    # バックテスト
-    ensemble_model.fit(df[FEATURES], df['long_target'])
-    backtest_results = run_backtest(df, ensemble_model, FEATURES)
-
-    # バックテスト結果の出力
-    print("\nバックテスト結果:")
-    print(f"総損益: {backtest_results['total_pnl']:.2f}")
-    print(f"勝率: {backtest_results['win_rate']:.2%}")
-    print(f"シャープレシオ: {backtest_results['sharpe_ratio']:.2f}")
-    print(f"最大ドローダウン: {backtest_results['max_drawdown']:.2%}")
-    print(f"P平均法: {backtest_results['p_average']:.2f}")
-    if backtest_results["mean_p"] is not None:
-        print(f"p値の平均: {backtest_results['mean_p']:.5f}")
-        print(f"有意判定: {'YES 🎯' if backtest_results['significant'] else 'NO ⚠'}")
-        print(f"エラー率推定: {backtest_results['error_rate']:.1e}")
-
-    # # ウォークフォワード分析
-    # ensemble_model.fit(df[FEATURES], df['long_target'])
-    # walk_forward_results = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
-
-    # # 全体の結果を集計
-    # total_pnl = sum(result['total_pnl'] for result in walk_forward_results)
-    # print("\nウォークフォワード分析の総結果:")
-    # print(f"総損益: {total_pnl:.2f}")
-
-    end_time = time.time()
-    print(f"✅ 全体の実行時間: {end_time - start_time:.2f} 秒")
+    # --- バックテスト ---
+    run_backtest(df, ensemble_model, FEATURES)
 
 if __name__ == "__main__":
     main()
