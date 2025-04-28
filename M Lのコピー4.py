@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import math
 import seaborn as sns
 import talib
 import time
@@ -10,6 +11,7 @@ import optuna
 import lightgbm as lgb
 import xgboost as xgb
 import catboost as cb
+from scipy.stats import ttest_1samp
 from sklearn.ensemble import RandomForestRegressor, StackingRegressor, VotingRegressor
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -50,6 +52,54 @@ def get_data(ticker, start_date, end_date, interval='1d'):
 # データ取得
 df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)
 df.head()
+
+# === データ前処理関数 ===
+def preprocess_data(df):
+    # 累積リターンを計算してデータフレームに追加
+    df['cum_ret'] = df['close'].pct_change().cumsum()  # 累積リターン
+    return df
+
+# === t検定関数 ===
+def perform_t_test(df):
+    x = df['cum_ret'].diff(1).dropna()  # 累積リターンの差分を計算
+    t, p = ttest_1samp(x, 0)  # t検定を実行
+    return t, p
+
+# === p平均法計算関数 ===
+def calc_p_mean(x, n):
+    ps = []
+    for i in range(n):
+        x2 = x[i * x.size // n:(i + 1) * x.size // n]
+        if np.std(x2) == 0:
+            ps.append(1)
+        else:
+            t, p = ttest_1samp(x2, 0)
+            if t > 0:
+                ps.append(p)
+            else:
+                ps.append(1)
+    return np.mean(ps)
+
+def calc_p_mean_type1_error_rate(p_mean, n):
+    return (p_mean * n) ** n / math.factorial(n)
+
+# === 結果表示関数 ===
+def display_results(df):
+    # t検定
+    print("t検定を実行中...")
+    x = df['cum_ret'].diff(1).dropna()
+    t, p = perform_t_test(df)
+    print(f"t値: {t:.5f}")
+    print(f"p値: {p:.5f}")
+
+    # p平均法
+    print("\np平均法を計算中...")
+    p_mean_n = 5
+    p_mean = calc_p_mean(x, p_mean_n)
+    error_rate = calc_p_mean_type1_error_rate(p_mean, p_mean_n)
+    print(f"p平均法 n = {p_mean_n}")
+    print(f"p平均: {p_mean:.5f}")
+    print(f"エラー率: {error_rate:.5e}")
 
 # スケーリング（MinMaxScalerを使用）
 def preprocess_data(df):
@@ -400,7 +450,6 @@ def create_ensemble_model(models, ensemble_type):
         ensemble_model = VotingRegressor(estimators=models, voting='soft')
     return ensemble_model
 
-# バックテスト関数（仮の例）
 # 売買ロジックを含むバックテスト関数
 def run_backtest(df, model, features):
     # トレーニング時の特徴量を使用
@@ -412,10 +461,10 @@ def run_backtest(df, model, features):
     equity_curve = [1.0]  # 資産曲線（初期資産を1.0とする）
 
     for i, pred in enumerate(predictions):
-        close_price = df.iloc[i]['close']  # 'close' 列が存在することを前提
+        close_price = df.iloc[i]['close']
 
         # 買いエントリー
-        if position is None and pred == 1:  # 予測が1（翌日上昇予測）の場合
+        if position is None and pred > 0.5:  # 予測が1（翌日上昇予測）の場合
             position = 'long'
             entry_price = close_price
             trade_log.append(('BUY', close_price))
@@ -431,6 +480,9 @@ def run_backtest(df, model, features):
                 trade_log.append(('SELL', close_price))
                 # 資産曲線を更新
                 equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
+            else:
+                # ポジションを維持する場合、資産曲線をそのまま更新
+                equity_curve.append(equity_curve[-1])
 
     # シャープレシオの計算
     daily_returns = np.diff(equity_curve) / equity_curve[:-1]
@@ -452,6 +504,8 @@ def run_backtest(df, model, features):
         "sharpe_ratio": sharpe_ratio,
         "max_drawdown": max_drawdown,
         "equity_curve": equity_curve,
+        "significant": significant,
+        "error_rate": error_rate,
     }
 
 def plot_asset_growth(asset_values):
@@ -464,15 +518,27 @@ def plot_asset_growth(asset_values):
 def generate_report(initial_capital, final_capital):
     total_return = (final_capital - initial_capital) / initial_capital
     print(f"Total Return: {total_return * 100:.2f}%")
+    return total_return
     # シャープレシオなど他の評価指標を追加
 
+# === メイン関数 ===
+# === メイン関数 ===
 def main():
     start_time = time.time()
 
     # 1. データの取得と前処理
-    print("データ取得と前処理を開始...")
+    print("データを取得しています...")
     df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)
+
+    print("データを前処理しています...")
     df = preprocess_data(df)
+
+    # デバッグ用: データフレームの先頭を表示
+    print("データフレームの先頭を確認:")
+    print(df.head())
+
+    print("結果を計算しています...")
+    display_results(df)
 
     # 特徴量生成
     print("特徴量を生成しています...")
@@ -493,8 +559,10 @@ def main():
 
     # 3. Optunaでのハイパーパラメータ最適化
     print("モデルの最適化を開始...")
+
     def objective(trial):
-        model_type = 'xgboost'
+        # モデルタイプを選択（例: 'xgboost', 'lightgbm', 'catboost', 'randomforest'）
+        model_type = trial.suggest_categorical('model_type', ['xgboost', 'lightgbm', 'catboost', 'randomforest'])
         return optimize_model(trial, model_type, X_train, y_train)
 
     study = optuna.create_study(direction='maximize')
@@ -511,7 +579,9 @@ def main():
 
     # 6. 予測とバックテスト
     print("予測とバックテストを開始...")
+    initial_capital = 10000  # 初期資産を定義
     capital_results = run_backtest(df, model, FEATURES)
+    final_capital = initial_capital * capital_results["equity_curve"][-1]  # 最終資産を計算
 
     # 7. 資産推移の可視化
     print("資産推移のグラフを描画...")
@@ -519,7 +589,18 @@ def main():
 
     # 8. 最終レポート
     print("最終レポートを表示...")
-    generate_report(10000, capital_results["equity_curve"][-1])  # 初期資産10000と最終資産値を表示
+    generate_report(initial_capital, final_capital)
+
+    # 9. シャープレシオ、最大ドローダウン、総損益、勝率を表示
+    print(f"シャープレシオ: {capital_results['sharpe_ratio']:.2f}")
+    print(f"最大ドローダウン: {capital_results['max_drawdown']:.2%}")
+    print(f"総損益: {capital_results['total_pnl']:.2f}")
+    print(f"勝率: {capital_results['win_rate']:.2%}")
+
+    # デバッグ用出力
+    print(f"Initial Capital: {initial_capital}")
+    print(f"Final Capital: {final_capital}")
+    print(f"Equity Curve: {capital_results['equity_curve']}")
 
     end_time = time.time()
     print(f"✅ 全体の実行時間: {end_time - start_time:.2f} 秒")
