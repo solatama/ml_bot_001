@@ -281,46 +281,34 @@ def calc_features(df):
     return df
 
 # === 相関係数による特徴量削除関数 ===
-def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
-    """
-    高い相関を持つ特徴量を削除する。
-    :param df: 特徴量データフレーム
-    :param threshold: 相関係数の閾値
-    :param exclude_columns: 削除対象から除外する列のリスト
-    :return: 相関が高くない特徴量を持つデータフレーム
-    """
-    if exclude_columns is None:
-        exclude_columns = []
+def select_features_pipeline(df, target_column, corr_threshold=0.9, top_n=10):
+    # 目的変数と 'close' 列を除いた特徴量データフレーム
+    features_df = df.drop(columns=[target_column, 'close'])
 
-    corr_matrix = df.corr().abs()
+    # 相関係数の計算
+    corr_matrix = features_df.corr().abs()
     upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > threshold) and column not in exclude_columns]
+    to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > corr_threshold)]
     print(f"🛠️ 削除された高相関特徴量: {to_drop}")
-    return df.drop(columns=to_drop)
+    reduced_df = features_df.drop(columns=to_drop)
 
-# === LightGBM重要度で上位特徴量を選択 ===
-def select_top_features_with_lightgbm(df, target, top_n=10):
-    """
-    LightGBMの重要度を用いて上位の特徴量を選択する。
-    :param df: 特徴量データフレーム
-    :param target: ターゲット列名
-    :param top_n: 選択する特徴量の数
-    :return: 上位特徴量のリスト
-    """
-    X = df.drop(columns=[target])
-    y = df[target]
-
+    # LightGBMによる特徴量重要度の計算
+    X = reduced_df
+    y = df[target_column]
     model = lgb.LGBMClassifier()
     model.fit(X, y)
-
     feature_importances = pd.DataFrame({
         'feature': X.columns,
         'importance': model.feature_importances_
     }).sort_values(by='importance', ascending=False)
 
+    # 上位特徴量の選択
     top_features = feature_importances.head(top_n)['feature'].tolist()
     print(f"🌟 LightGBMで選ばれた上位 {top_n} 特徴量: {top_features}")
-    return top_features
+
+    # 選択された特徴量と 'close' 列、目的変数を含むデータフレームの作成
+    selected_df = df[top_features + ['close', target_column]]
+    return selected_df
 
 # モデル定義
 def create_lgbm_model():
@@ -424,7 +412,7 @@ def run_backtest(df, model, features):
     equity_curve = [1.0]  # 資産曲線（初期資産を1.0とする）
 
     for i, pred in enumerate(predictions):
-        close_price = df.iloc[i]['close']
+        close_price = df.iloc[i]['close']  # 'close' 列が存在することを前提
 
         # 買いエントリー
         if position is None and pred == 1:  # 予測が1（翌日上昇予測）の場合
@@ -486,9 +474,18 @@ def main():
     df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)
     df = preprocess_data(df)
 
+    # 特徴量生成
+    print("特徴量を生成しています...")
+    df = calc_features(df)
+
+    # 特徴量選択
+    print("特徴量選択を開始...")
+    df = select_features_pipeline(df, target_column='long_target', corr_threshold=0.9, top_n=20)
+
     # 特徴量とターゲットに分割
+    FEATURES = [col for col in df.columns if col not in ['long_target']]
     X = df[FEATURES].values
-    y = df['close_scaled'].values  # ここでは予測対象をclose_scaledにしています
+    y = df['long_target'].values
 
     # 2. データ分割
     print("データをトレーニングセットとテストセットに分割...")
