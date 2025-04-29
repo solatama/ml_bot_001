@@ -421,6 +421,7 @@ def optimize_model(trial, model_type, X_train, y_train):
             'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
             'num_leaves': trial.suggest_int('num_leaves', 30, 150),
             'max_depth': trial.suggest_int('max_depth', 3, 15),
+            'force_col_wise': True,
         }
         model = lgb.LGBMRegressor(**params)
     elif model_type == 'catboost':
@@ -498,9 +499,8 @@ def create_ensemble_model(models, ensemble_type):
 
 # 売買ロジックを含むバックテスト関数
 def run_backtest(df, model, features):
-
     # トレーニング時の特徴量を使用
-    predictions = model.predict(df[features])
+    predictions = model.predict(df[features])  # df[features] を使用して特徴量名を保持
     position = None
     entry_price = 0
     pnl = []
@@ -599,8 +599,8 @@ def main():
 
     # 特徴量とターゲットに分割
     FEATURES = [col for col in df.columns if col not in ['long_target']]
-    X = df[FEATURES].values
-    y = df['long_target'].values
+    X = df[FEATURES]
+    y = df['long_target']
 
     # 2. データ分割
     print("データをトレーニングセットとテストセットに分割...")
@@ -673,7 +673,7 @@ def main():
     # デバッグ用出力
     print(f"Initial Capital: {initial_capital}")
     print(f"Final Capital: {final_capital}")
-    print(f"Equity Curve: {capital_results['equity_curve']}")
+    # print(f"Equity Curve: {capital_results['equity_curve']}")
 
     end_time = time.time()
     print(f"✅ 全体の実行時間: {end_time - start_time:.2f} 秒")
