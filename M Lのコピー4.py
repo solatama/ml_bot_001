@@ -107,6 +107,10 @@ def display_results(df):
 
 # スケーリング（MinMaxScalerを使用）
 def preprocess_data(df):
+    if 'close' not in df.columns:
+        raise ValueError("Error: 'close' 列がデータフレームに存在しません。")
+
+    # スケーリング（MinMaxScalerを使用）
     scaler = MinMaxScaler()
     df['close_scaled'] = scaler.fit_transform(df[['close']])
     return df
@@ -405,7 +409,11 @@ class TransformerModel(nn.Module):
 def create_transformer_model(input_dim, hidden_dim=64, output_dim=1):
     return TransformerModel(input_dim, hidden_dim, output_dim)
 
-# Optunaでハイパーパラメータチューニング
+# Optunaでハイパーパラメータチューニング（シャープレシオを最適化）
+from sklearn.model_selection import KFold
+
+from sklearn.model_selection import KFold
+
 def optimize_model(trial, model_type, X_train, y_train):
     if model_type == 'xgboost':
         params = {
@@ -439,9 +447,23 @@ def optimize_model(trial, model_type, X_train, y_train):
         }
         model = RandomForestRegressor(**params)
 
-    # クロスバリデーションを使用した評価
-    score = cross_val_score(model, X_train, y_train, cv=3, scoring='neg_mean_absolute_error')
-    return score.mean()
+    # クロスバリデーションの設定
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    sharpe_ratios = []
+
+    for train_index, test_index in kf.split(X_train):
+        X_train_fold, X_test_fold = X_train.iloc[train_index], X_train.iloc[test_index]
+        y_train_fold, y_test_fold = y_train.iloc[train_index], y_train.iloc[test_index]
+
+        # モデルのトレーニング
+        model.fit(X_train_fold, y_train_fold)
+
+        # バックテストを実行してシャープレシオを計算
+        backtest_result = run_backtest(X_test_fold, model, FEATURES)
+        sharpe_ratios.append(backtest_result['sharpe_ratio'])
+
+    # シャープレシオの平均を返す
+    return np.mean(sharpe_ratios) if sharpe_ratios else -np.inf
 
 def run_walk_forward_backtest(df, model, features, n_splits=5):
     """
@@ -499,6 +521,11 @@ def create_ensemble_model(models, ensemble_type):
 
 # 売買ロジックを含むバックテスト関数
 def run_backtest(df, model, features):
+    # 特徴量がデータフレームに存在するか確認
+    missing_features = [feature for feature in features if feature not in df.columns]
+    if missing_features:
+        raise ValueError(f"Error: 以下の特徴量がデータフレームに存在しません: {missing_features}")
+    
     # トレーニング時の特徴量を使用
     predictions = model.predict(df[features])  # df[features] を使用して特徴量名を保持
     position = None
@@ -581,10 +608,6 @@ def main():
     df['return'] = df['close'].pct_change().fillna(0)
     df['cum_ret'] = (1 + df['return']).cumprod()
 
-    # デバッグ用: データフレームの先頭を表示
-    print("データフレームの先頭を確認:")
-    print(df.head())
-
     # 結果を計算して表示
     print("結果を計算しています...")
     results = display_results(df)
@@ -599,6 +622,7 @@ def main():
 
     # 特徴量とターゲットに分割
     FEATURES = [col for col in df.columns if col not in ['long_target']]
+    print("使用する特徴量:", FEATURES)
     X = df[FEATURES]
     y = df['long_target']
 
@@ -618,9 +642,17 @@ def main():
     study.optimize(objective, n_trials=10)  # n_trialsで試行回数を調整
     print("最適化完了！最適パラメータ：", study.best_params)
 
-    # 4. モデルの作成
-    model = create_xgboost_model()
-    model.set_params(**study.best_params)
+    # 4. 最適なモデルの作成
+    model_type = study.best_params['model_type']
+    params = {k: v for k, v in study.best_params.items() if k != 'model_type'}
+    if model_type == 'xgboost':
+        model = xgb.XGBRegressor(**params)
+    elif model_type == 'lightgbm':
+        model = lgb.LGBMRegressor(**params)
+    elif model_type == 'catboost':
+        model = cb.CatBoostRegressor(**params, silent=True)
+    elif model_type == 'randomforest':
+        model = RandomForestRegressor(**params)
 
     # 5. モデルの学習
     print("モデルの学習を開始...")
