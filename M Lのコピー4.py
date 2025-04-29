@@ -22,13 +22,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 # === 定数定義 ===
-TICKER = '6836.T'
+TICKER = '8918.T'
 START_DATE = '2024-04-01'
 END_DATE = '2025-04-10'
 INTERVAL = '1d' # '1m' '5m' '15m' '30m' '1h' '1wk' '1mo'
 
 FEATURES = ['close_scaled']
-STOP_LOSS_MODE = 1  # 1: 固定パーセント損切り, 2: パラボリックSAR損切り, 3: 直近安値更新
+STOP_LOSS_MODE = 2  # 1: 固定パーセント損切り, 2: パラボリックSAR損切り, 3: 直近安値更新
 STOP_LOSS = 0.02    # 固定パーセント損切りでの損失許容率（例: 2%）
 TAKE_PROFIT = 0.04  # 利確幅（例: 4%）
 COMMISSION = 0.0005  # 手数料率（必要なら設定）
@@ -54,9 +54,11 @@ df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)
 df.head()
 
 # === データ前処理関数 ===
-def preprocess_data(df):
-    # 累積リターンを計算してデータフレームに追加
-    df['cum_ret'] = df['close'].pct_change().cumsum()  # 累積リターン
+def preprocess_data(df, add_cum_ret=True, scale_close=True):
+    if add_cum_ret:
+        df['cum_ret'] = df['close'].pct_change().cumsum()
+    if scale_close:
+        df['close_scaled'] = (df['close'] - df['close'].mean()) / df['close'].std()
     return df
 
 # === t検定関数 ===
@@ -68,12 +70,12 @@ def perform_t_test(df):
 # === p平均法計算関数 ===
 def calc_p_mean(x, n):
     ps = []
-    for i in range(n):
-        x2 = x[i * x.size // n:(i + 1) * x.size // n]
-        if np.std(x2) == 0:
+    segments = np.array_split(x, n)  # 自動的に等分割（端数も含む）
+    for segment in segments:
+        if np.std(segment) == 0:
             ps.append(1)
         else:
-            t, p = ttest_1samp(x2, 0)
+            t, p = ttest_1samp(segment, 0)
             if t > 0:
                 ps.append(p)
             else:
@@ -104,16 +106,6 @@ def display_results(df):
         "p平均": p_mean,
         "エラー率": error_rate
     }
-
-# スケーリング（MinMaxScalerを使用）
-def preprocess_data(df):
-    if 'close' not in df.columns:
-        raise ValueError("Error: 'close' 列がデータフレームに存在しません。")
-
-    # スケーリング（MinMaxScalerを使用）
-    scaler = MinMaxScaler()
-    df['close_scaled'] = scaler.fit_transform(df[['close']])
-    return df
 
 def calc_features(df):
     required_columns = ['open', 'high', 'low', 'close', 'volume']
@@ -335,6 +327,9 @@ def calc_features(df):
     # 例: 翌日の終値が当日の終値より高ければ1、そうでなければ0
     df['long_target'] = (df['close'].shift(-1) > df['close']).astype(int)
 
+    # 最初の特徴量生成後のNaN列除去・インデックス調整（先頭にNaNが出るため）
+    df = df.dropna().reset_index(drop=True)
+
     df.dropna(inplace=True)
     return df
 
@@ -406,64 +401,104 @@ class TransformerModel(nn.Module):
         transformer_out = self.transformer(x)
         return self.fc(transformer_out[:, -1, :])
 
+from sklearn.model_selection import KFold
+
+def cross_val_sharpe(model, X, y, df, n_splits=5):
+    """
+    クロスバリデーションを使用してシャープレシオを計算する関数
+    :param model: 機械学習モデル
+    :param X: 特徴量データ
+    :param y: ターゲットデータ
+    :param n_splits: クロスバリデーションの分割数
+    :return: 平均シャープレシオ
+    """
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    sharpe_ratios = []
+
+    for train_index, test_index in kf.split(X):
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+
+        # モデルのトレーニング
+        model.fit(X_train, y_train)
+
+        # 予測とバックテスト
+        predictions = model.predict(X_test)
+        pnl = []
+        position = None
+        entry_price = 0
+
+        for i, pred in enumerate(predictions):
+            close_prices = df.loc[X_test.index, 'close']
+            for i, pred in enumerate(predictions):
+                close_price = close_prices.iloc[i]
+            if position is None and pred > 0.5:
+                position = 'long'
+                entry_price = close_price
+            if position == 'long':
+                stop_loss = entry_price * (1 - STOP_LOSS)
+                take_profit = entry_price * (1 + TAKE_PROFIT)
+                if close_price <= stop_loss or close_price >= take_profit:
+                    profit = close_price - entry_price - (close_price * COMMISSION + close_price * SLIPPAGE)
+                    pnl.append(profit)
+                    position = None
+
+        if pnl:
+            equity_curve = np.cumsum(pnl) + 1.0
+            daily_returns = np.diff(equity_curve) / equity_curve[:-1]
+            sharpe_ratio = (np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252)
+                if len(daily_returns) > 1 and np.std(daily_returns) > 0 else 0)
+            sharpe_ratios.append(sharpe_ratio)
+
+    return np.mean(sharpe_ratios) if sharpe_ratios else -np.inf
+
 def create_transformer_model(input_dim, hidden_dim=64, output_dim=1):
     return TransformerModel(input_dim, hidden_dim, output_dim)
 
 # Optunaでハイパーパラメータチューニング（シャープレシオを最適化）
 from sklearn.model_selection import KFold
 
-from sklearn.model_selection import KFold
+def optimize_model(trial, model_type, X, y, df):
+    try:
+        # ハイパーパラメータの提案
+        if model_type == 'xgboost':
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'max_depth': trial.suggest_int('max_depth', 3, 15),
+                'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
+                'subsample': trial.suggest_float("subsample", 0.6, 1.0),
+            }
+            model = xgb.XGBRegressor(**params)
+        elif model_type == 'lightgbm':
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
+                'num_leaves': trial.suggest_int('num_leaves', 30, 150),
+                'max_depth': trial.suggest_int('max_depth', 3, 15),
+                'force_col_wise': True,
+            }
+            model = lgb.LGBMRegressor(**params)
+        elif model_type == 'catboost':
+            params = {
+                'iterations': trial.suggest_int('iterations', 100, 1000),
+                'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
+                'depth': trial.suggest_int('depth', 3, 15),
+            }
+            model = cb.CatBoostRegressor(**params, silent=True)
+        elif model_type == 'randomforest':
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'max_depth': trial.suggest_int('max_depth', 3, 15),
+                'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+            }
+            model = RandomForestRegressor(**params)
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
 
-def optimize_model(trial, model_type, X_train, y_train):
-    if model_type == 'xgboost':
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-            'max_depth': trial.suggest_int('max_depth', 3, 15),
-            'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
-            'subsample': trial.suggest_float("subsample", 0.6, 1.0),
-        }
-        model = xgb.XGBRegressor(**params)
-    elif model_type == 'lightgbm':
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-            'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 30, 150),
-            'max_depth': trial.suggest_int('max_depth', 3, 15),
-            'force_col_wise': True,
-        }
-        model = lgb.LGBMRegressor(**params)
-    elif model_type == 'catboost':
-        params = {
-            'iterations': trial.suggest_int('iterations', 100, 1000),
-            'learning_rate': trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True),
-            'depth': trial.suggest_int('depth', 3, 15),
-        }
-        model = cb.CatBoostRegressor(**params, silent=True)
-    elif model_type == 'randomforest':
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-            'max_depth': trial.suggest_int('max_depth', 3, 15),
-            'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-        }
-        model = RandomForestRegressor(**params)
+        # cross_val_sharpe関数を使用して平均シャープレシオを計算
+        avg_sharpe = cross_val_sharpe(model, X, y, df, n_splits=5)
 
-    # クロスバリデーションの設定
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    sharpe_ratios = []
-
-    for train_index, test_index in kf.split(X_train):
-        X_train_fold, X_test_fold = X_train.iloc[train_index], X_train.iloc[test_index]
-        y_train_fold, y_test_fold = y_train.iloc[train_index], y_train.iloc[test_index]
-
-        # モデルのトレーニング
-        model.fit(X_train_fold, y_train_fold)
-
-        # バックテストを実行してシャープレシオを計算
-        backtest_result = run_backtest(X_test_fold, model, FEATURES)
-        sharpe_ratios.append(backtest_result['sharpe_ratio'])
-
-    # シャープレシオの平均を返す
-    return np.mean(sharpe_ratios) if sharpe_ratios else -np.inf
+        return avg_sharpe
 
 def run_walk_forward_backtest(df, model, features, n_splits=5):
     """
@@ -513,8 +548,8 @@ def create_ensemble_model(models, ensemble_type):
         ensemble_model = StackingRegressor(estimators=models)
     elif ensemble_type == 'blending':
         ensemble_model = VotingRegressor(estimators=models)
-    elif ensemble_type == 'voting_hard':
-        ensemble_model = VotingRegressor(estimators=models, voting='hard')
+    elif ensemble_type == 'voting':
+        ensemble_model = VotingRegressor(estimators=models)
     elif ensemble_type == 'voting_soft':
         ensemble_model = VotingRegressor(estimators=models, voting='soft')
     return ensemble_model
@@ -525,73 +560,116 @@ def run_backtest(df, model, features):
     missing_features = [feature for feature in features if feature not in df.columns]
     if missing_features:
         raise ValueError(f"Error: 以下の特徴量がデータフレームに存在しません: {missing_features}")
-    
-    # トレーニング時の特徴量を使用
-    predictions = model.predict(df[features])  # df[features] を使用して特徴量名を保持
+
+    print("使用する特徴量:", features)
+    print("データフレームの列名:", df.columns)
+
+    # 予測実行
+    predictions = model.predict(df[features])
+
     position = None
     entry_price = 0
+    entry_index = None  # 保有期間のためのエントリー時点インデックス
     pnl = []
     trade_log = []
-    equity_curve = [1.0]  # 資産曲線（初期資産を1.0とする）
+    equity_curve = [1.0]  # 初期資産 1.0
 
     for i, pred in enumerate(predictions):
         close_price = df.iloc[i]['close']
 
-        # 買いエントリー
-        if position is None and pred > 0.5:  # 予測が1（翌日上昇予測）の場合
+        # エントリー：買い
+        if position is None and pred > 0.4:  # シグナル条件
             position = 'long'
             entry_price = close_price
-            trade_log.append(('BUY', close_price))
+            entry_index = i
+            trade_log.append(('BUY', close_price, i))  # 時刻情報を記録
 
-        # 売りエグジット
+        # エグジット判定
         if position == 'long':
             stop_loss = entry_price * (1 - STOP_LOSS)
             take_profit = entry_price * (1 + TAKE_PROFIT)
             if close_price <= stop_loss or close_price >= take_profit:
+                # 利益計算（手数料・スリッページ考慮）
                 profit = close_price - entry_price - (close_price * COMMISSION + close_price * SLIPPAGE)
                 pnl.append(profit)
-                position = None
-                trade_log.append(('SELL', close_price))
-                # 資産曲線を更新
+
+                holding_period = i - entry_index
+                trade_log.append(('SELL', close_price, i, profit, holding_period))
+
+                # 資産更新
                 equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
+                position = None
+                entry_price = 0
+                entry_index = None
             else:
-                # ポジションを維持する場合、資産曲線をそのまま更新
-                equity_curve.append(equity_curve[-1])
+                equity_curve.append(equity_curve[-1])  # 保持中は資産変化なし
+        elif position is None:
+            equity_curve.append(equity_curve[-1])  # ノーポジでも資産維持
 
-    # シャープレシオの計算
+    # ポジション持ち越し防止（強制決済）
+    if position == 'long':
+        close_price = df.iloc[-1]['close']
+        profit = close_price - entry_price - (close_price * COMMISSION + close_price * SLIPPAGE)
+        pnl.append(profit)
+        holding_period = len(df) - entry_index
+        trade_log.append(('FORCED_SELL', close_price, len(df)-1, profit, holding_period))
+        equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
+        position = None
+
+    # 指標計算
     daily_returns = np.diff(equity_curve) / equity_curve[:-1]
-    sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252) if len(daily_returns) > 1 else 0
+    if len(daily_returns) > 1 and np.std(daily_returns) > 0:
+        sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252)
+    else:
+        sharpe_ratio = 0
 
-    # 最大ドローダウンの計算
     equity_curve_array = np.array(equity_curve)
     drawdown = equity_curve_array / np.maximum.accumulate(equity_curve_array) - 1
     max_drawdown = drawdown.min()
 
-    # 総損益と勝率
     total_pnl = np.sum(pnl)
     win_rate = np.mean(np.array(pnl) > 0) if pnl else 0
 
-    # 結果を辞書形式で返す
+    # 結果を返す
     return {
         "total_pnl": total_pnl,
         "win_rate": win_rate,
         "sharpe_ratio": sharpe_ratio,
         "max_drawdown": max_drawdown,
         "equity_curve": equity_curve,
+        "trade_log": trade_log,
+        "pnl": pnl,
     }
 
 def plot_asset_growth(asset_values):
-    plt.plot(asset_values)
+    equity = np.array(asset_values)
+    running_max = np.maximum.accumulate(equity)
+    drawdown = equity / running_max - 1
+
+    plt.figure(figsize=(10, 5))
+    plt.subplot(2, 1, 1)
+    plt.plot(equity)
     plt.title('Asset Growth Over Time')
-    plt.xlabel('Time')
     plt.ylabel('Asset Value')
+
+    plt.subplot(2, 1, 2)
+    plt.plot(drawdown, color='red')
+    plt.title('Drawdown')
+    plt.ylabel('Drawdown')
+    plt.xlabel('Time')
+    plt.tight_layout()
     plt.show()
 
-def generate_report(initial_capital, final_capital):
+def generate_report(initial_capital, final_capital, backtest_result):
     total_return = (final_capital - initial_capital) / initial_capital
     print(f"Total Return: {total_return * 100:.2f}%")
+    print(f"Win Rate: {backtest_result['win_rate'] * 100:.2f}%")
+    print(f"Sharpe Ratio: {backtest_result['sharpe_ratio']:.2f}")
+    print(f"Max Drawdown: {backtest_result['max_drawdown'] * 100:.2f}%")
+    print(f"Total Trades: {len(backtest_result['pnl'])}")
+    if backtest_result['pnl']:
+        print(f"Average PnL per Trade: {np.mean(backtest_result['pnl']):.2f}")
     return total_return
-    # シャープレシオなど他の評価指標を追加
 
 # === メイン関数 ===
 def main():
@@ -634,9 +712,12 @@ def main():
     print("モデルの最適化を開始...")
 
     def objective(trial):
-        # モデルタイプを選択（例: 'xgboost', 'lightgbm', 'catboost', 'randomforest'）
-        model_type = trial.suggest_categorical('model_type', ['xgboost', 'lightgbm', 'catboost', 'randomforest'])
-        return optimize_model(trial, model_type, X_train, y_train)
+        try:
+            model_type = trial.suggest_categorical("model_type", ["xgboost", "lightgbm", "catboost", "randomforest"])
+            return optimize_model(trial, model_type, X_train, y_train, df_train)
+        except Exception as e:
+            print(f"Trial failed due to: {e}")
+            return None
 
     study = optuna.create_study(direction='maximize')
     study.optimize(objective, n_trials=10)  # n_trialsで試行回数を調整
@@ -684,7 +765,11 @@ def main():
 
     # ウォークフォワード分析の結果を集計
     total_pnl = sum(result['total_pnl'] for result in walk_forward_results)
-    avg_sharpe_ratio = np.mean([result['sharpe_ratio'] for result in walk_forward_results])
+
+    # 有効なシャープレシオのみを抽出して平均を計算
+    valid_sharpe_ratios = [result['sharpe_ratio'] for result in walk_forward_results if result['sharpe_ratio'] != -np.inf]
+    avg_sharpe_ratio = np.mean(valid_sharpe_ratios) if valid_sharpe_ratios else 0
+
     avg_max_drawdown = np.mean([result['max_drawdown'] for result in walk_forward_results])
     avg_win_rate = np.mean([result['win_rate'] for result in walk_forward_results])
 
