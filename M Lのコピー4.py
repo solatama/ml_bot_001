@@ -22,10 +22,10 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 # === 定数定義 ===
-TICKER = '9684.T'
+TICKER = '6836.T'
 START_DATE = '2024-04-01'
 END_DATE = '2025-04-10'
-INTERVAL = '1d'
+INTERVAL = '1d' # '1m' '5m' '15m' '30m' '1h' '1wk' '1mo'
 
 FEATURES = ['close_scaled']
 STOP_LOSS_MODE = 1  # 1: 固定パーセント損切り, 2: パラボリックSAR損切り, 3: 直近安値更新
@@ -89,17 +89,21 @@ def display_results(df):
     print("t検定を実行中...")
     x = df['cum_ret'].diff(1).dropna()
     t, p = perform_t_test(df)
-    print(f"t値: {t:.5f}")
-    print(f"p値: {p:.5f}")
 
     # p平均法
     print("\np平均法を計算中...")
     p_mean_n = 5
     p_mean = calc_p_mean(x, p_mean_n)
     error_rate = calc_p_mean_type1_error_rate(p_mean, p_mean_n)
-    print(f"p平均法 n = {p_mean_n}")
-    print(f"p平均: {p_mean:.5f}")
-    print(f"エラー率: {error_rate:.5e}")
+
+    # 結果を辞書形式で返す
+    return {
+        "t値": t,
+        "p値": p,
+        "p平均法_n": p_mean_n,
+        "p平均": p_mean,
+        "エラー率": error_rate
+    }
 
 # スケーリング（MinMaxScalerを使用）
 def preprocess_data(df):
@@ -438,6 +442,48 @@ def optimize_model(trial, model_type, X_train, y_train):
     score = cross_val_score(model, X_train, y_train, cv=3, scoring='neg_mean_absolute_error')
     return score.mean()
 
+def run_walk_forward_backtest(df, model, features, n_splits=5):
+    """
+    ウォークフォワード分析を実行する。
+    :param df: データフレーム
+    :param model: モデル
+    :param features: 使用する特徴量のリスト
+    :param n_splits: ウォークフォワードの分割数
+    :return: 各期間のバックテスト結果のリスト
+    """
+    results = []
+    split_size = len(df) // n_splits
+
+    for i in range(n_splits):
+        print(f"\n=== ウォークフォワード期間 {i + 1}/{n_splits} ===")
+        train_start = 0
+        train_end = split_size * (i + 1)
+        test_start = train_end
+        test_end = split_size * (i + 2)
+
+        # トレーニングデータとテストデータに分割
+        train_data = df.iloc[train_start:train_end]
+        test_data = df.iloc[test_start:test_end]
+
+        if len(test_data) == 0:
+            break
+
+        # モデルのトレーニング
+        model.fit(train_data[features], train_data['long_target'])
+
+        # バックテストの実行
+        backtest_result = run_backtest(test_data, model, features)
+        results.append(backtest_result)
+
+        # 各期間の結果を表示
+        print(f"期間 {i + 1} の結果:")
+        print(f"総損益: {backtest_result['total_pnl']:.2f}")
+        print(f"勝率: {backtest_result['win_rate']:.2%}")
+        print(f"シャープレシオ: {backtest_result['sharpe_ratio']:.2f}")
+        print(f"最大ドローダウン: {backtest_result['max_drawdown']:.2%}")
+
+    return results
+
 # アンサンブル手法（stacking）
 def create_ensemble_model(models, ensemble_type):
     if ensemble_type == 'stacking':
@@ -452,6 +498,7 @@ def create_ensemble_model(models, ensemble_type):
 
 # 売買ロジックを含むバックテスト関数
 def run_backtest(df, model, features):
+
     # トレーニング時の特徴量を使用
     predictions = model.predict(df[features])
     position = None
@@ -504,8 +551,6 @@ def run_backtest(df, model, features):
         "sharpe_ratio": sharpe_ratio,
         "max_drawdown": max_drawdown,
         "equity_curve": equity_curve,
-        "significant": significant,
-        "error_rate": error_rate,
     }
 
 def plot_asset_growth(asset_values):
@@ -522,23 +567,27 @@ def generate_report(initial_capital, final_capital):
     # シャープレシオなど他の評価指標を追加
 
 # === メイン関数 ===
-# === メイン関数 ===
 def main():
     start_time = time.time()
 
     # 1. データの取得と前処理
     print("データを取得しています...")
-    df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)
+    df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)  # データを取得
 
     print("データを前処理しています...")
-    df = preprocess_data(df)
+    df = preprocess_data(df)  # 前処理を実行
+
+    # 累積リターンを計算してデータフレームに追加
+    df['return'] = df['close'].pct_change().fillna(0)
+    df['cum_ret'] = (1 + df['return']).cumprod()
 
     # デバッグ用: データフレームの先頭を表示
     print("データフレームの先頭を確認:")
     print(df.head())
 
+    # 結果を計算して表示
     print("結果を計算しています...")
-    display_results(df)
+    results = display_results(df)
 
     # 特徴量生成
     print("特徴量を生成しています...")
@@ -596,6 +645,30 @@ def main():
     print(f"最大ドローダウン: {capital_results['max_drawdown']:.2%}")
     print(f"総損益: {capital_results['total_pnl']:.2f}")
     print(f"勝率: {capital_results['win_rate']:.2%}")
+
+    # 10. ウォークフォワード分析
+    print("\nウォークフォワード分析を開始...")
+    walk_forward_results = run_walk_forward_backtest(df, model, FEATURES, n_splits=5)
+
+    # ウォークフォワード分析の結果を集計
+    total_pnl = sum(result['total_pnl'] for result in walk_forward_results)
+    avg_sharpe_ratio = np.mean([result['sharpe_ratio'] for result in walk_forward_results])
+    avg_max_drawdown = np.mean([result['max_drawdown'] for result in walk_forward_results])
+    avg_win_rate = np.mean([result['win_rate'] for result in walk_forward_results])
+
+    print("\nウォークフォワード分析の総結果:")
+    print(f"総損益: {total_pnl:.2f}")
+    print(f"平均シャープレシオ: {avg_sharpe_ratio:.2f}")
+    print(f"平均最大ドローダウン: {avg_max_drawdown:.2%}")
+    print(f"平均勝率: {avg_win_rate:.2%}")
+
+    # t検定とp平均法の結果を表示
+    print("\n統計的検定結果:")
+    print(f"t値: {results['t値']:.5f}")
+    print(f"p値: {results['p値']:.5f}")
+    print(f"p平均法 n = {results['p平均法_n']}")
+    print(f"p平均: {results['p平均']:.5f}")
+    print(f"エラー率: {results['エラー率']:.5e}")
 
     # デバッグ用出力
     print(f"Initial Capital: {initial_capital}")
