@@ -621,6 +621,9 @@ def main():
     ensemble_model.fit(df[FEATURES], df['long_target'])
     backtest_results = run_backtest(df, ensemble_model, FEATURES)
 
+    # ウォークフォワード分析
+    run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
+
     # t検定を実行
     t_stat, p_value = perform_t_test(df)
     print(f"t検定の結果: t値={t_stat:.4f}, p値={p_value:.4f}")
