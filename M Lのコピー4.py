@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 import numpy as np
 import pandas as pd
 from math import factorial
@@ -42,8 +43,8 @@ def get_data(ticker, start_date, end_date, interval='1d'):
         df.columns = [col.lower() for col in df.columns]
         return df
     except Exception as e:
-        print(f"データ取得エラー: {e}")
-        return pd.DataFrame()
+        print(f"[エラー] データ取得に失敗しました: {e}")
+        raise  # エラーをそのまま投げて処理を中断
 
 # === 2. データ前処理関数 ===
 def add_cumret(df):
@@ -172,9 +173,12 @@ def calc_features(df):
     df['LOW_ratio'] = df['low'] / df['low'].shift(1)  # Changed df[low_col] to df['low']
 
     # Lag特徴量
-    df['CLOSE_lag_1'] = df['close'].shift(1)  # 1日遅れの終値 # Changed df[close_col] to df['close']
-    df['CLOSE_lag_5'] = df['close'].shift(5)  # 5日遅れの終値 # Changed df[close_col] to df['close']
-    df['MOVIENG_avg_5'] = df['close'].rolling(window=5).mean()  # 5日移動平均 # Changed df[close_col] to df['close']
+    # Lag特徴量を一括生成
+    lags = [1, 3, 5, 10, 20]
+    for lag in lags:
+        df[f'close_lag_{lag}'] = df['close'].shift(lag)
+        df[f'return_lag_{lag}'] = df['close'].pct_change(lag)
+        df[f'log_return_lag_{lag}'] = np.log(df['close'] / df['close'].shift(lag))
     # 周期性の特徴量
     df['DAY_of_week'] = df.index.dayofweek  # 曜日（0=月曜日, 6=日曜日）
     df['IS_weekend'] = (df['DAY_of_week'] >= 5).astype(int)  # 週末かどうか
@@ -377,6 +381,10 @@ def create_model(model_type, params=None):
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
+# モデル作成
+def create_base_models(selected_models, best_params_dict):
+    return [(name, create_model(name, best_params_dict[name])) for name in selected_models]
+
 # === Optunaによるハイパーパラメータ最適化 ===
 def optimize_hyperparameters(df, model_type):
     def objective(trial):
@@ -521,6 +529,19 @@ def run_backtest(df, model, features):
         "equity_curve": equity_curve,
     }
 
+# モデルのトレーニングと評価
+def train_and_evaluate_model(df, features, target, model_class, test_size=0.2):
+    X = df[features]
+    y = df[target]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+
+    model = model_class()
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    return model, accuracy
+
+# === ウォークフォワード分析 ===
 def run_walk_forward_backtest(df, model, features, n_splits=5):
     """
     ウォークフォワード分析を実行する。
@@ -556,6 +577,54 @@ def run_walk_forward_backtest(df, model, features, n_splits=5):
 
     return results
 
+# === バックテスト結果のプロット ===def plot_capital_curve(backtest_results):
+def plot_capital_curve(backtest_results):
+    plt.figure(figsize=(10, 5))
+    plt.plot(backtest_results['equity_curve'], label='Equity Curve')
+    plt.title('資産推移')
+    plt.xlabel('期間')
+    plt.ylabel('資産')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+def display_backtest_results(results):
+    print("\nバックテスト結果:")
+    print(f"{'項目':<15} {'値':>10}")
+    print(f"{'-'*25}")
+    for key, value in results.items():
+        if isinstance(value, list):  # 値がリストの場合
+            print(f"{key:<15} {len(value):>10} (リストの長さ)")
+        elif isinstance(value, (int, float)):  # 値が数値の場合
+            print(f"{key:<15} {value:>10.2f}")
+        else:  # その他の型の場合
+            print(f"{key:<15} {str(value):>10}")
+
+# バックテスト結果を保存
+def save_backtest_results(backtest_results, filename="backtest_results.csv"):
+    # equity_curve をデータフレームに変換
+    equity_df = pd.DataFrame({
+        "equity_curve": backtest_results["equity_curve"]
+    })
+    equity_df.to_csv(filename, index=False)
+    print(f"バックテスト結果を {filename} に保存しました。")
+
+# ウォークフォワード分析結果を保存
+def save_walk_forward_results(walk_forward_results, filename="walk_forward_results.csv"):
+    # 各期間の結果をデータフレームに変換
+    results_list = []
+    for i, result in enumerate(walk_forward_results):
+        results_list.append({
+            "fold": i + 1,
+            "total_pnl": result["total_pnl"],
+            "win_rate": result["win_rate"],
+            "sharpe_ratio": result["sharpe_ratio"],
+            "max_drawdown": result["max_drawdown"]
+        })
+    results_df = pd.DataFrame(results_list)
+    results_df.to_csv(filename, index=False)
+    print(f"ウォークフォワード分析結果を {filename} に保存しました。")
+
 # === メイン処理 ===
 def main():
     start_time = time.time()
@@ -566,22 +635,14 @@ def main():
         print("データが取得できませんでした。処理を終了します。")
         return
 
-    print("[DEBUG] fetch_data 後のデータフレーム:")
-    print(df.head())
-    print("[DEBUG] fetch_data 後の列名:", df.columns.tolist())
-
     # 特徴量生成
     df = calc_features(df)
-
-    print("🔍 特徴量生成後の列:", df.columns.tolist())
 
     # 相関係数による特徴量削除
     df = remove_highly_correlated_features(df, exclude_columns=['close'])
 
     # 累積リターンを計算
     df = add_cumret(df)
-
-    print("🔍 高相関特徴量削除後の列:", df.columns.tolist())
 
     # 目的変数を除いた全列名をFEATURESに
     FEATURES = [col for col in df.columns if col != 'long_target']
@@ -601,7 +662,7 @@ def main():
     best_params_dict = {model: optimize_hyperparameters(df, model) for model in SELECTED_MODELS}
 
     # モデル作成
-    base_models = [(name, create_model(name, best_params_dict[name])) for name in SELECTED_MODELS]
+    base_models = create_base_models(SELECTED_MODELS, best_params_dict)
 
     # 各モデルのトレーニング
     for name, model in base_models:
@@ -621,8 +682,21 @@ def main():
     ensemble_model.fit(df[FEATURES], df['long_target'])
     backtest_results = run_backtest(df, ensemble_model, FEATURES)
 
+    # バックテスト結果の出力
+    display_backtest_results(backtest_results)
+    # バックテスト結果を保存
+    save_backtest_results(backtest_results, filename="backtest_results.csv")
+
+    # 資産推移のプロット
+    plot_capital_curve(backtest_results)
+
     # ウォークフォワード分析
     run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
+    # ウォークフォワード分析
+    walk_forward_results = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
+    # ウォークフォワード分析結果を保存
+    save_walk_forward_results(walk_forward_results, filename="walk_forward_results.csv")
+
 
     # t検定を実行
     t_stat, p_value = perform_t_test(df)
@@ -634,13 +708,12 @@ def main():
     alpha = 0.03
     mean_p, significant, error_rate = p_mean_test(x, period=period, alpha=alpha)
     print(f"p平均法の結果: 平均p値={mean_p:.4f}, 有意かどうか={significant}, エラー率={error_rate:.4e}")
+    print('========================================================')
 
-    # バックテスト結果の出力
-    print("\nバックテスト結果:")
-    print(f"総損益: {backtest_results['total_pnl']:.2f}")
-    print(f"勝率: {backtest_results['win_rate']:.2%}")
-    print(f"シャープレシオ: {backtest_results['sharpe_ratio']:.2f}")
-    print(f"最大ドローダウン: {backtest_results['max_drawdown']:.2%}")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    logging.info("データ取得完了")
+    logging.debug(f"データフレームの先頭: {df.head()}")
 
     end_time = time.time()
     print(f"✅ 全体の実行時間: {end_time - start_time:.2f} 秒")
