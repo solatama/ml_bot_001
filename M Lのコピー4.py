@@ -338,6 +338,30 @@ def select_top_features_with_lightgbm(df, target, top_n=10):
     print(f"🌟 LightGBMで選ばれた上位 {top_n} 特徴量: {top_features}")
     return top_features
 
+# === t検定関数 ===
+def perform_t_test(df):
+    x = df['cum_ret'].diff(1).dropna()  # 累積リターンの差分を計算
+    t, p = ttest_1samp(x, 0)  # t検定を実行
+    return t, p
+
+# === p平均法計算関数 ===
+def calc_p_mean(x, n):
+    ps = []
+    for i in range(n):
+        x2 = x[i * x.size // n:(i + 1) * x.size // n]
+        if np.std(x2) == 0:
+            ps.append(1)
+        else:
+            t, p = ttest_1samp(x2, 0)
+            if t > 0:
+                ps.append(p)
+            else:
+                ps.append(1)
+    return np.mean(ps)
+
+def calc_p_mean_type1_error_rate(p_mean, n):
+    return (p_mean * n) ** n / math.factorial(n)
+
 # === モデル作成 ===
 def create_model(model_type, params=None):
     if model_type == 'lightgbm':
@@ -554,6 +578,9 @@ def main():
     # 相関係数による特徴量削除
     df = remove_highly_correlated_features(df, exclude_columns=['close'])
 
+    # 累積リターンを計算
+    df = add_cumret(df)
+
     print("🔍 高相関特徴量削除後の列:", df.columns.tolist())
 
     # 目的変数を除いた全列名をFEATURESに
@@ -593,6 +620,17 @@ def main():
     # バックテスト
     ensemble_model.fit(df[FEATURES], df['long_target'])
     backtest_results = run_backtest(df, ensemble_model, FEATURES)
+
+    # t検定を実行
+    t_stat, p_value = perform_t_test(df)
+    print(f"t検定の結果: t値={t_stat:.4f}, p値={p_value:.4f}")
+
+    # p平均法を実行
+    x = df['cum_ret'].diff(1).dropna()  # 累積リターンの差分を計算
+    period = 14
+    alpha = 0.03
+    mean_p, significant, error_rate = p_mean_test(x, period=period, alpha=alpha)
+    print(f"p平均法の結果: 平均p値={mean_p:.4f}, 有意かどうか={significant}, エラー率={error_rate:.4e}")
 
     # バックテスト結果の出力
     print("\nバックテスト結果:")
