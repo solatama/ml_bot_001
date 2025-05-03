@@ -1,18 +1,21 @@
-import os
-import time
 import logging
 import numpy as np
 import pandas as pd
 from math import factorial
 import matplotlib.pyplot as plt
+import seaborn as sns
 import talib
 import yfinance as yf
 from sklearn.base import BaseEstimator, ClassifierMixin
+import time
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import log_loss
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier, StackingClassifier, VotingClassifier
 from sklearn.neural_network import MLPClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 from scipy.stats import ttest_1samp
 import lightgbm as lgb
 import xgboost as xgb
@@ -31,7 +34,7 @@ STOP_LOSS = 0.02
 TAKE_PROFIT = 0.05
 COMMISSION = 0.001
 SLIPPAGE = 0.001
-SELECTED_MODELS = ['xgboost', 'randomforest', 'catboost', 'lightgbm'] #'lightgbm',
+SELECTED_MODELS = ['xgboost', 'randomforest', 'catboost', 'lightgbm', 'mlp'] #'lightgbm',
 ENSEMBLE_TYPE = 'stacking'  # 'blending', 'stacking', 'voting_hard', 'voting_soft'
 
 # === 1. データ取得関数 ===
@@ -406,15 +409,17 @@ def create_base_models(selected_models, best_params_dict):
     return [(name, create_model(name, best_params_dict[name])) for name in selected_models]
 
 # === 11. Optunaによるハイパーパラメータ最適化 ===
-def optimize_hyperparameters(df, model_type):
+def optimize_final_estimator(df, features):
     def objective(trial):
-        # モデルごとに異なるハイパーパラメータを設定
+        model_type = trial.suggest_categorical('model_type', ['lightgbm', 'xgboost', 'catboost', 'randomforest', 'mlp'])
+
         if model_type == 'lightgbm':
             params = {
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
                 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
             }
+            model = LGBMClassifier(**params)
         elif model_type == 'xgboost':
             params = {
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
@@ -422,12 +427,14 @@ def optimize_hyperparameters(df, model_type):
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
                 'gamma': trial.suggest_float('gamma', 0, 5),
             }
+            model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', **params)
         elif model_type == 'catboost':
             params = {
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
                 'depth': trial.suggest_int('depth', 3, 10),
                 'iterations': trial.suggest_int('iterations', 100, 1000),
             }
+            model = CatBoostClassifier(verbose=0, **params)
         elif model_type == 'randomforest':
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
@@ -435,25 +442,52 @@ def optimize_hyperparameters(df, model_type):
                 'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
                 'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
             }
+            model = RandomForestClassifier(**params)
+        elif model_type == 'mlp':
+            params = {
+                'hidden_layer_sizes': trial.suggest_categorical('hidden_layer_sizes', [(100,), (100, 50), (200, 100)]),
+                'activation': trial.suggest_categorical('activation', ['relu', 'tanh']),
+                'solver': trial.suggest_categorical('solver', ['adam', 'sgd']),
+                'alpha': trial.suggest_float('alpha', 1e-5, 1e-2, log=True),
+                'learning_rate_init': trial.suggest_float('learning_rate_init', 1e-4, 1e-2),
+                'max_iter': 1000
+            }
+            model = MLPClassifier(**params)
         else:
-            raise ValueError(f"Unsupported model type for optimization: {model_type}")
+            raise ValueError(f"Unsupported model type: {model_type}")
 
-        # モデルを作成してスコアを計算
-        model = create_model(model_type, params)
         scores = []
         tscv = TimeSeriesSplit(n_splits=3)
         for train_idx, test_idx in tscv.split(df):
-            X_train, X_test = df.iloc[train_idx][FEATURES], df.iloc[test_idx][FEATURES]
+            X_train, X_test = df.iloc[train_idx][features], df.iloc[test_idx][features]
             y_train, y_test = df.iloc[train_idx]['long_target'], df.iloc[test_idx]['long_target']
             model.fit(X_train, y_train)
             preds = model.predict_proba(X_test)[:, 1]
             scores.append(log_loss(y_test, preds))
+
         return np.mean(scores)
 
-    # Optunaで最適化
     study = optuna.create_study(direction='minimize', pruner=MedianPruner())
     study.optimize(objective, n_trials=30)
-    return study.best_params
+
+    best_model_type = study.best_params['model_type']
+    best_params = {k: v for k, v in study.best_params.items() if k != 'model_type'}
+
+    # ベストモデルのインスタンスを作成して返す
+    if best_model_type == 'lightgbm':
+        model = LGBMClassifier(**best_params)
+    elif best_model_type == 'xgboost':
+        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', **best_params)
+    elif best_model_type == 'catboost':
+        model = CatBoostClassifier(verbose=0, **best_params)
+    elif best_model_type == 'randomforest':
+        model = RandomForestClassifier(**best_params)
+    elif best_model_type == 'mlp':
+        model = MLPClassifier(**best_params)
+    else:
+        raise ValueError(f"Unsupported model type: {best_model_type}")
+
+    return model
 
 # === 12. p平均法によるストラテジー有意性検定 ===
 def p_mean_test(returns, period=14, alpha=0.03):
@@ -505,7 +539,7 @@ def run_backtest(df, model, features):
     for i, pred in enumerate(predictions):
         close_price = df.iloc[i]['close']
 
-        if position is None and pred > 0.5:
+        if position is None and pred > 0.7:
             position = 'long'
             entry_price = close_price
 
@@ -564,8 +598,6 @@ def train_and_evaluate_model(df, features, target, model_class, test_size=0.2):
     return model, accuracy
 
 # === 16. ウォークフォワード分析 ===
-from sklearn.base import clone
-
 def run_walk_forward_backtest(df, model, features, n_splits=5):
     tscv = TimeSeriesSplit(n_splits=n_splits)
     fold_results = []
@@ -599,24 +631,24 @@ def run_walk_forward_backtest(df, model, features, n_splits=5):
 
 # === 17. モンテカルロシミュレーション =====
 def monte_carlo_simulation(equity_curve, n_simulations=1000):
+    """
+    モンテカルロシミュレーションを実行する。
+    - equity_curve: 資産推移データ（リストまたは1D配列）
+    - n_simulations: 試行回数
+    """
+    returns = np.diff(equity_curve) / equity_curve[:-1]  # 収益率を計算
+    returns = np.nan_to_num(returns, nan=0.0)  # NaNを0に変換
+
     final_returns = []
-    max_drawdowns = []
-
     for _ in range(n_simulations):
-        shuffled_returns = np.random.permutation(np.diff(equity_curve) / equity_curve[:-1])
-        sim_curve = [1.0]
-        for r in shuffled_returns:
-            sim_curve.append(sim_curve[-1] * (1 + r))
+        random_returns = np.random.choice(returns, size=len(returns), replace=True)
+        simulated_curve = np.cumprod(1 + random_returns)
+        final_returns.append(simulated_curve[-1])
 
-        sim_curve = np.array(sim_curve)
-        final_return = sim_curve[-1] - 1
-        drawdown = sim_curve / np.maximum.accumulate(sim_curve) - 1
-        max_dd = drawdown.min()
+    mean_final = np.mean(final_returns)
+    std_final = np.std(final_returns)
 
-        final_returns.append(final_return)
-        max_drawdowns.append(max_dd)
-
-    return np.array(final_returns), np.array(max_drawdowns)
+    return mean_final, std_final
 
 # === 18. アウトオブサンプルテスト =====
 def run_oos_test(df, model_class, features, train_ratio=0.8):
@@ -697,45 +729,16 @@ def save_walk_forward_results(walk_forward_results, filename="walk_forward_resul
 optuna_logger = optuna.logging.get_logger("optuna")
 optuna_logger.setLevel(logging.WARNING)  # INFO ログを非表示にする
 
-# === 21. メイン関数 ===
-import time
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import clone
-from tqdm import tqdm
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.ensemble import StackingClassifier, VotingClassifier
-from sklearn.neural_network import MLPClassifier
-
-# 必要な自作関数（get_data, basic_preprocessing, calc_features, etc.）は別途importされている前提です
 
 def main():
     start_time = time.time()
 
     steps = [
-        "データ取得",
-        "前処理（スケーリング）",
-        "特徴量生成",
-        "相関係数による特徴量削除",
-        "累積リターン計算",
-        "特徴量選択",
-        "モデル最適化",
-        "モデル作成",
-        "各モデルのトレーニング",
-        "アンサンブル作成",
-        "バックテスト実行",
-        "バックテスト結果保存",
-        "ウォークフォワード分析",
-        "ウォークフォワード結果保存",
-        "モンテカルロシミュレーション",
-        "ロバスト最適化",
-        "t検定",
-        "p平均法",
-        "可視化"
+        "データ取得", "前処理（スケーリング）", "特徴量生成", "相関係数による特徴量削除",
+        "累積リターン計算", "特徴量選択", "ベースモデル最適化", "ファイナルエスティメータ最適化",
+        "アンサンブル作成", "バックテスト実行", "バックテスト結果保存",
+        "ウォークフォワード分析", "ウォークフォワード結果保存",
+        "モンテカルロシミュレーション", "ロバスト最適化", "t検定", "p平均法", "可視化"
     ]
 
     with tqdm(total=len(steps), desc="進捗状況") as pbar:
@@ -774,28 +777,17 @@ def main():
         print(f"🔍 LightGBM選抜特徴量: {FEATURES}")
         pbar.update(1)
 
-        # モデル最適化
+        # ベースモデル最適化
         best_params_dict = {model: optimize_hyperparameters(df, model) for model in SELECTED_MODELS}
-        pbar.update(1)
-
-        # モデル作成
         base_models = create_base_models(SELECTED_MODELS, best_params_dict)
         pbar.update(1)
 
-        # 各モデルのトレーニング
-        for name, model in base_models:
-            model.fit(df[FEATURES], df['long_target'])
+        # ファイナルエスティメータ最適化
+        final_estimator = optimize_final_estimator(df, FEATURES)
         pbar.update(1)
 
         # アンサンブル作成
-        if ENSEMBLE_TYPE == 'stacking':
-            ensemble_model = StackingClassifier(estimators=base_models, final_estimator=MLPClassifier(max_iter=1000))
-        elif ENSEMBLE_TYPE == 'voting_hard':
-            ensemble_model = VotingClassifier(estimators=base_models, voting='hard')
-        elif ENSEMBLE_TYPE == 'voting_soft':
-            ensemble_model = VotingClassifier(estimators=base_models, voting='soft')
-        else:
-            raise ValueError(f"Unsupported ensemble type: {ENSEMBLE_TYPE}")
+        ensemble_model = StackingClassifier(estimators=base_models, final_estimator=final_estimator)
         pbar.update(1)
 
         # バックテスト実行
@@ -818,8 +810,9 @@ def main():
         pbar.update(1)
 
         # モンテカルロシミュレーション
-        mc_mean, mc_std = monte_carlo_simulation(df['cum_ret'], n_simulations=1000)
-        print(f"🎲 モンテカルロ結果: 平均最終リターン={mc_mean[0]:.4f}, 標準偏差={mc_std[0]:.4f}")
+        equity_curve = backtest_results['equity_curve']
+        mean_final, std_final = monte_carlo_simulation(equity_curve)
+        print(f"🎲 モンテカルロ結果: 平均最終リターン={mean_final:.4f}, 標準偏差={std_final:.4f}")
         pbar.update(1)
 
         # ロバスト最適化
