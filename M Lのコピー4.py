@@ -496,14 +496,11 @@ from scipy.special import softmax
 
 # === 14. バックテスト関数 ===
 def run_backtest(df, model, features):
-
-    # トレーニング時の特徴量を使用
     predictions = model.predict(df[features])
     position = None
     entry_price = 0
     pnl = []
-    trade_log = []
-    equity_curve = [1.0]  # 資産曲線（初期資産を1.0とする）
+    equity_curve = [1.0]
 
     for i, pred in enumerate(predictions):
         close_price = df.iloc[i]['close']
@@ -511,7 +508,6 @@ def run_backtest(df, model, features):
         if position is None and pred > 0.5:
             position = 'long'
             entry_price = close_price
-            trade_log.append(('BUY', close_price))
 
         if position == 'long':
             stop_loss = entry_price * (1 - STOP_LOSS)
@@ -520,31 +516,16 @@ def run_backtest(df, model, features):
                 profit = close_price - entry_price - (entry_price * COMMISSION + close_price * SLIPPAGE)
                 pnl.append(profit)
                 position = None
-                trade_log.append(('SELL', close_price))
-                # 資産曲線の更新
-                profit = close_price - entry_price - (entry_price * COMMISSION + close_price * SLIPPAGE)
                 equity_curve.append(equity_curve[-1] * (1 + profit / entry_price))
 
-    # シャープレシオの計算
     daily_returns = np.diff(equity_curve) / equity_curve[:-1]
-    if len(daily_returns) > 1 and np.std(daily_returns) > 0:
-        sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252)
-    else:
-        sharpe_ratio = 0
-
-    # 最大ドローダウンの計算
+    sharpe_ratio = np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252) if len(daily_returns) > 1 and np.std(daily_returns) > 0 else 0
     equity_curve_array = np.array(equity_curve)
-    if len(equity_curve_array) > 0:
-        drawdown = equity_curve_array / np.maximum.accumulate(equity_curve_array) - 1
-        max_drawdown = drawdown.min()
-    else:
-        max_drawdown = 0
-
-    # 総損益と勝率
+    drawdown = equity_curve_array / np.maximum.accumulate(equity_curve_array) - 1
+    max_drawdown = drawdown.min() if len(drawdown) > 0 else 0
     total_pnl = np.sum(pnl)
     win_rate = np.mean(np.array(pnl) > 0) if pnl else 0
 
-    # 結果を辞書形式で返す
     return {
         "total_pnl": total_pnl,
         "win_rate": win_rate,
@@ -552,6 +533,23 @@ def run_backtest(df, model, features):
         "max_drawdown": max_drawdown,
         "equity_curve": equity_curve,
     }
+
+# 可視化関数
+def plot_equity_curve(df):
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['cum_ret'], label='Equity Curve')
+    plt.title('Equity Curve')
+    plt.xlabel('Date')
+    plt.ylabel('Cumulative Return')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+def plot_feature_heatmap(df, features):
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(df[features].corr(), annot=True, cmap='coolwarm')
+    plt.title('Feature Correlation Heatmap')
+    plt.show()
 
 # === 15. モデルのトレーニングと評価 ===
 def train_and_evaluate_model(df, features, target, model_class, test_size=0.2):
@@ -566,50 +564,80 @@ def train_and_evaluate_model(df, features, target, model_class, test_size=0.2):
     return model, accuracy
 
 # === 16. ウォークフォワード分析 ===
+from sklearn.base import clone
+
 def run_walk_forward_backtest(df, model, features, n_splits=5):
-    """
-    ウォークフォワード分析を実行する。
-    :param df: 特徴量がすでに計算されたデータフレーム
-    :param model: モデル
-    :param features: 使用する特徴量のリスト
-    :param n_splits: ウォークフォワードの分割数
-    :return: 各期間のバックテスト結果のリスト
-    """
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    results = []
+    fold_results = []
+    train_returns = []
+    test_returns = []
 
-    # 進捗バーを設定
-    with tqdm(total=n_splits, desc="ウォークフォワード分析") as pbar:
-        for fold, (train_idx, test_idx) in enumerate(tscv.split(df)):
-            # トレーニングデータとテストデータに分割
-            train_df = df.iloc[train_idx].copy()
-            test_df = df.iloc[test_idx].copy()
+    for train_idx, test_idx in tqdm(tscv.split(df)):
+        train_df, test_df = df.iloc[train_idx], df.iloc[test_idx]
 
-            # ✅ calc_features呼び出しを削除！
+        cloned_model = clone(model)
+        cloned_model.fit(train_df[features], train_df['long_target'])
 
-            # スケーリング
-            scaler = MinMaxScaler()
-            train_df[features] = scaler.fit_transform(train_df[features])
-            test_df[features] = scaler.transform(test_df[features])
+        train_bt = run_backtest(train_df, cloned_model, features)
+        train_equity = np.array(train_bt['equity_curve'])
+        train_return = train_equity[-1] / train_equity[0] - 1
+        train_returns.append(train_return)
 
-            # モデルのトレーニング
-            model.fit(train_df[features], train_df['long_target'])
+        test_bt = run_backtest(test_df, cloned_model, features)
+        fold_results.append(test_bt)
 
-            # テストデータでバックテストを実行
-            backtest_result = run_backtest(test_df, model, features)
-            results.append(backtest_result)
+        test_equity = np.array(test_bt['equity_curve'])
+        test_return = test_equity[-1] / test_equity[0] - 1
+        test_returns.append(test_return)
 
-            # 進捗バーを更新
-            pbar.set_postfix({
-                "期間": f"{fold + 1}/{n_splits}",
-                "総損益": f"{backtest_result['total_pnl']:.2f}",
-                "勝率": f"{backtest_result['win_rate']:.2%}",
-                "シャープレシオ": f"{backtest_result['sharpe_ratio']:.2f}",
-                "最大ドローダウン": f"{backtest_result['max_drawdown']:.2%}"
-            })
-            pbar.update(1)
+    train_returns = np.array(train_returns)
+    test_returns = np.array(test_returns)
+    wfe_list = test_returns / train_returns
+    wfe = np.mean(wfe_list)
 
-    return results
+    return fold_results, wfe
+
+# === 17. モンテカルロシミュレーション =====
+def monte_carlo_simulation(equity_curve, n_simulations=1000):
+    final_returns = []
+    max_drawdowns = []
+
+    for _ in range(n_simulations):
+        shuffled_returns = np.random.permutation(np.diff(equity_curve) / equity_curve[:-1])
+        sim_curve = [1.0]
+        for r in shuffled_returns:
+            sim_curve.append(sim_curve[-1] * (1 + r))
+
+        sim_curve = np.array(sim_curve)
+        final_return = sim_curve[-1] - 1
+        drawdown = sim_curve / np.maximum.accumulate(sim_curve) - 1
+        max_dd = drawdown.min()
+
+        final_returns.append(final_return)
+        max_drawdowns.append(max_dd)
+
+    return np.array(final_returns), np.array(max_drawdowns)
+
+# === 18. アウトオブサンプルテスト =====
+def run_oos_test(df, model_class, features, train_ratio=0.8):
+    n_train = int(len(df) * train_ratio)
+    train_df = df.iloc[:n_train]
+    oos_df = df.iloc[n_train:]
+
+    model = model_class()
+    model.fit(train_df[features], train_df['long_target'])
+
+    oos_bt = run_backtest(oos_df, model, features)
+
+    return oos_bt
+
+# === 19. ロバスト最適化スコア計算 =====
+def calculate_robust_score(fold_results):
+    sharpe_ratios = [r['sharpe_ratio'] for r in fold_results]
+    mean_sr = np.mean(sharpe_ratios)
+    std_sr = np.std(sharpe_ratios)
+    robust_score = mean_sr - std_sr
+    return robust_score
 
 # === 17. バックテスト結果のプロット ===def plot_capital_curve(backtest_results):
 def plot_capital_curve(backtest_results):
@@ -670,7 +698,20 @@ optuna_logger = optuna.logging.get_logger("optuna")
 optuna_logger.setLevel(logging.WARNING)  # INFO ログを非表示にする
 
 # === 21. メイン関数 ===
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.base import clone
+from tqdm import tqdm
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import StackingClassifier, VotingClassifier
+from sklearn.neural_network import MLPClassifier
+
+# 必要な自作関数（get_data, basic_preprocessing, calc_features, etc.）は別途importされている前提です
 
 def main():
     start_time = time.time()
@@ -690,20 +731,22 @@ def main():
         "バックテスト結果保存",
         "ウォークフォワード分析",
         "ウォークフォワード結果保存",
+        "モンテカルロシミュレーション",
+        "ロバスト最適化",
         "t検定",
-        "p平均法"
+        "p平均法",
+        "可視化"
     ]
 
     with tqdm(total=len(steps), desc="進捗状況") as pbar:
-
         # データ取得
         df = get_data(TICKER, START_DATE, END_DATE, INTERVAL)
-        if df is None:
+        if df is None or df.empty:
             print("データが取得できませんでした。処理を終了します。")
             return
         pbar.update(1)
 
-        # 前処理（close_scaled作成）
+        # 前処理
         df = basic_preprocessing(df)
         pbar.update(1)
 
@@ -711,16 +754,13 @@ def main():
         df = calc_features(df)
         pbar.update(1)
 
-        # 相関係数による特徴量削除（close, close_scaledは除外）
+        # 相関除去
         df = remove_highly_correlated_features(df, exclude_columns=['close', 'close_scaled'])
         pbar.update(1)
 
-        # 特徴量リスト作成（long_target以外）
-        FEATURES = [col for col in df.columns if col not in ['long_target', 'close', 'close_scaled']]
-        print(f"🔍 使用する特徴量（スケーリング対象）: {FEATURES}")
-
         # スケーリング
-        scaler = MinMaxScaler(feature_range=(0, 1))
+        FEATURES = [col for col in df.columns if col not in ['long_target', 'close', 'close_scaled']]
+        scaler = MinMaxScaler()
         df[FEATURES] = scaler.fit_transform(df[FEATURES])
         pbar.update(1)
 
@@ -728,7 +768,7 @@ def main():
         df = add_cumret(df)
         pbar.update(1)
 
-        # LightGBMによる重要特徴量選択
+        # 特徴量選択
         top_features = select_top_features_with_lightgbm(df, target='long_target', top_n=10)
         FEATURES = top_features
         print(f"🔍 LightGBM選抜特徴量: {FEATURES}")
@@ -769,11 +809,22 @@ def main():
         pbar.update(1)
 
         # ウォークフォワード分析
-        walk_forward_results = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
+        fold_results, wfe = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
+        print(f"🛫 ウォークフォワード効率 (WFE): {wfe:.4f}")
         pbar.update(1)
 
         # ウォークフォワード結果保存
-        save_walk_forward_results(walk_forward_results, filename="walk_forward_results.csv")
+        save_walk_forward_results(fold_results, filename="walk_forward_results.csv")
+        pbar.update(1)
+
+        # モンテカルロシミュレーション
+        mc_mean, mc_std = monte_carlo_simulation(df['cum_ret'], n_simulations=1000)
+        print(f"🎲 モンテカルロ結果: 平均最終リターン={mc_mean[0]:.4f}, 標準偏差={mc_std[0]:.4f}")
+        pbar.update(1)
+
+        # ロバスト最適化
+        robustness_score = calculate_robust_score(fold_results)
+        print(f"🛡️ ロバストネススコア: {robustness_score:.4f}")
         pbar.update(1)
 
         # t検定
@@ -789,10 +840,14 @@ def main():
         print(f"📈 p平均法結果: 平均p値={mean_p:.4f}, 有意かどうか={significant}, エラー率={error_rate:.4e}")
         pbar.update(1)
 
-        print('========================================================')
+        # 可視化
+        plot_equity_curve(df)
+        plot_feature_heatmap(df, FEATURES)
+        pbar.update(1)
 
     end_time = time.time()
-    print(f"✅ 全体の実行時間: {end_time - start_time:.2f} 秒")
+    print('========================================================')
+    print(f"✅ 完了！全体の実行時間: {end_time - start_time:.2f} 秒")
 
 if __name__ == "__main__":
     main()
