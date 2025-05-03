@@ -59,6 +59,13 @@ def scale_features(df, features):
     df_scaled[features] = scaler.fit_transform(df[features])
     return df_scaled
 
+def basic_preprocessing(df):
+    from sklearn.preprocessing import MinMaxScaler
+
+    scaler = MinMaxScaler()
+    df['close_scaled'] = scaler.fit_transform(df[['close']])
+    return df
+
 # === 4. 特徴量生成 ===
 def calc_features(df):
     required_columns = ['open', 'high', 'low', 'close', 'volume']
@@ -301,10 +308,18 @@ def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
     if exclude_columns is None:
         exclude_columns = []
 
+    # 相関行列を計算
     corr_matrix = df.corr().abs()
+
+    # 上三角行列を取得
     upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+    # 高相関の列を特定
     to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > threshold) and column not in exclude_columns]
+
     print(f"🛠️ 削除された高相関特徴量: {to_drop}")
+
+    # 高相関の列を削除
     return df.drop(columns=to_drop)
 
 # === 6. LightGBM Sklearn Wrapper ===
@@ -554,7 +569,7 @@ def train_and_evaluate_model(df, features, target, model_class, test_size=0.2):
 def run_walk_forward_backtest(df, model, features, n_splits=5):
     """
     ウォークフォワード分析を実行する。
-    :param df: データフレーム
+    :param df: 特徴量がすでに計算されたデータフレーム
     :param model: モデル
     :param features: 使用する特徴量のリスト
     :param n_splits: ウォークフォワードの分割数
@@ -570,9 +585,7 @@ def run_walk_forward_backtest(df, model, features, n_splits=5):
             train_df = df.iloc[train_idx].copy()
             test_df = df.iloc[test_idx].copy()
 
-            # 特徴量生成
-            train_df = calc_features(train_df)
-            test_df = calc_features(test_df)
+            # ✅ calc_features呼び出しを削除！
 
             # スケーリング
             scaler = MinMaxScaler()
@@ -585,9 +598,6 @@ def run_walk_forward_backtest(df, model, features, n_splits=5):
             # テストデータでバックテストを実行
             backtest_result = run_backtest(test_df, model, features)
             results.append(backtest_result)
-
-            print(f"train_df.columns: {train_df.columns}")
-            print(f"test_df.columns: {test_df.columns}")
 
             # 進捗バーを更新
             pbar.set_postfix({
@@ -665,19 +675,25 @@ from sklearn.model_selection import TimeSeriesSplit
 def main():
     start_time = time.time()
 
-    # 進捗バーの設定
     steps = [
         "データ取得",
+        "前処理（スケーリング）",
         "特徴量生成",
         "相関係数による特徴量削除",
         "累積リターン計算",
         "特徴量選択",
         "モデル最適化",
         "モデル作成",
-        "バックテスト",
+        "各モデルのトレーニング",
+        "アンサンブル作成",
+        "バックテスト実行",
+        "バックテスト結果保存",
         "ウォークフォワード分析",
-        "t検定とp平均法"
+        "ウォークフォワード結果保存",
+        "t検定",
+        "p平均法"
     ]
+
     with tqdm(total=len(steps), desc="進捗状況") as pbar:
 
         # データ取得
@@ -685,48 +701,37 @@ def main():
         if df is None:
             print("データが取得できませんでした。処理を終了します。")
             return
-        pbar.update(1)  # 進捗を1ステップ進める
+        pbar.update(1)
+
+        # 前処理（close_scaled作成）
+        df = basic_preprocessing(df)
+        pbar.update(1)
 
         # 特徴量生成
         df = calc_features(df)
         pbar.update(1)
 
-        # 相関係数による特徴量削除
-        df = remove_highly_correlated_features(df, exclude_columns=['close'])
+        # 相関係数による特徴量削除（close, close_scaledは除外）
+        df = remove_highly_correlated_features(df, exclude_columns=['close', 'close_scaled'])
         pbar.update(1)
 
-        # 累積リターンを計算
-        df = add_cumret(df)
-        pbar.update(1)
-
-        # 目的変数を除いた全列名をFEATURESに
-        FEATURES = [col for col in df.columns if col != 'long_target']
-        pbar.update(1)
-
-        # LightGBMで上位特徴量を選択
-        top_features = select_top_features_with_lightgbm(df, target='long_target', top_n=10)
-        FEATURES = top_features
-        print("🔍 使用する特徴量:", FEATURES)
-        pbar.update(1)
+        # 特徴量リスト作成（long_target以外）
+        FEATURES = [col for col in df.columns if col not in ['long_target', 'close', 'close_scaled']]
+        print(f"🔍 使用する特徴量（スケーリング対象）: {FEATURES}")
 
         # スケーリング
         scaler = MinMaxScaler(feature_range=(0, 1))
         df[FEATURES] = scaler.fit_transform(df[FEATURES])
         pbar.update(1)
 
-        # TimeSeriesSplit を使用してデータを分割
-        tscv = TimeSeriesSplit(n_splits=5)
-        for fold, (train_idx, test_idx) in enumerate(tscv.split(df)):
-            print(f"=== ウォークフォワード期間 {fold + 1}/5 ===")
+        # 累積リターン計算
+        df = add_cumret(df)
+        pbar.update(1)
 
-            # トレーニングデータとテストデータに分割
-            train_df = df.iloc[train_idx].copy()
-            test_df = df.iloc[test_idx].copy()
-
-            # モデルのトレーニングとバックテストをここで実行
-            # 必要に応じて処理を追加
-            print(f"train_df.shape: {train_df.shape}, test_df.shape: {test_df.shape}")
-
+        # LightGBMによる重要特徴量選択
+        top_features = select_top_features_with_lightgbm(df, target='long_target', top_n=10)
+        FEATURES = top_features
+        print(f"🔍 LightGBM選抜特徴量: {FEATURES}")
         pbar.update(1)
 
         # モデル最適化
@@ -742,7 +747,7 @@ def main():
             model.fit(df[FEATURES], df['long_target'])
         pbar.update(1)
 
-        # アンサンブルモデル
+        # アンサンブル作成
         if ENSEMBLE_TYPE == 'stacking':
             ensemble_model = StackingClassifier(estimators=base_models, final_estimator=MLPClassifier(max_iter=1000))
         elif ENSEMBLE_TYPE == 'voting_hard':
@@ -753,41 +758,37 @@ def main():
             raise ValueError(f"Unsupported ensemble type: {ENSEMBLE_TYPE}")
         pbar.update(1)
 
-        # バックテスト
+        # バックテスト実行
         ensemble_model.fit(df[FEATURES], df['long_target'])
         backtest_results = run_backtest(df, ensemble_model, FEATURES)
         pbar.update(1)
 
-        # バックテスト結果の出力
+        # バックテスト結果保存
         display_backtest_results(backtest_results)
-        pbar.update(1)
-        # バックテスト結果を保存
         save_backtest_results(backtest_results, filename="backtest_results.csv")
         pbar.update(1)
-
-        # 資産推移のプロット
-        # plot_capital_curve(backtest_results)
-        # pbar.update(1)
 
         # ウォークフォワード分析
         walk_forward_results = run_walk_forward_backtest(df, ensemble_model, FEATURES, n_splits=5)
         pbar.update(1)
-        # ウォークフォワード分析結果を保存
+
+        # ウォークフォワード結果保存
         save_walk_forward_results(walk_forward_results, filename="walk_forward_results.csv")
         pbar.update(1)
 
-        # t検定を実行
+        # t検定
         t_stat, p_value = perform_t_test(df)
-        print(f"t検定の結果: t値={t_stat:.4f}, p値={p_value:.4f}")
+        print(f"🧪 t検定結果: t値={t_stat:.4f}, p値={p_value:.4f}")
         pbar.update(1)
 
-        # p平均法を実行
-        x = df['cum_ret'].diff(1).dropna()  # 累積リターンの差分を計算
+        # p平均法
+        x = df['cum_ret'].diff(1).dropna()
         period = 14
         alpha = 0.03
         mean_p, significant, error_rate = p_mean_test(x, period=period, alpha=alpha)
-        print(f"p平均法の結果: 平均p値={mean_p:.4f}, 有意かどうか={significant}, エラー率={error_rate:.4e}")
+        print(f"📈 p平均法結果: 平均p値={mean_p:.4f}, 有意かどうか={significant}, エラー率={error_rate:.4e}")
         pbar.update(1)
+
         print('========================================================')
 
     end_time = time.time()
