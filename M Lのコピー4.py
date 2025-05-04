@@ -22,6 +22,9 @@ import xgboost as xgb
 from catboost import CatBoostClassifier
 import optuna
 from optuna.pruners import MedianPruner
+import torch
+import torch.nn as nn
+from sklearn.base import BaseEstimator, ClassifierMixin
 from tqdm import tqdm
 
 # === 定数定義 ===
@@ -300,13 +303,15 @@ def calc_features(df):
     return df
 
 # === 5. 相関係数による特徴量削除関数 ===
-def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
+def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None, verbose=True):
     """
     高い相関を持つ特徴量を削除する。
-    :param df: 特徴量データフレーム
-    :param threshold: 相関係数の閾値
+
+    :param df: 特徴量データフレーム（元dfは変更されない）
+    :param threshold: 相関係数の閾値（絶対値）
     :param exclude_columns: 削除対象から除外する列のリスト
-    :return: 相関が高くない特徴量を持つデータフレーム
+    :param verbose: 削除対象列を表示するかどうか
+    :return: 高相関を持たない特徴量のみのデータフレーム
     """
     if exclude_columns is None:
         exclude_columns = []
@@ -317,29 +322,100 @@ def remove_highly_correlated_features(df, threshold=0.9, exclude_columns=None):
     # 上三角行列を取得
     upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
 
-    # 高相関の列を特定
-    to_drop = [column for column in upper_triangle.columns if any(upper_triangle[column] > threshold) and column not in exclude_columns]
+    # 高相関な列を探す
+    to_drop = []
+    for column in upper_triangle.columns:
+        if column in exclude_columns:
+            continue
+        if any(upper_triangle[column] > threshold):
+            to_drop.append(column)
+            if verbose:
+                high_corr_features = upper_triangle.index[upper_triangle[column] > threshold].tolist()
+                print(f"🛠️ 高相関: {column} と {high_corr_features} が閾値 {threshold} 超え -> {column} 削除")
 
-    print(f"🛠️ 削除された高相関特徴量: {to_drop}")
+    if verbose and not to_drop:
+        print("✅ 高相関の特徴量は見つかりませんでした。")
 
-    # 高相関の列を削除
     return df.drop(columns=to_drop)
 
 # === 6. LightGBM Sklearn Wrapper ===
 class LightGBMSklearnWrapper(BaseEstimator, ClassifierMixin):
     def __init__(self, **params):
-        import lightgbm as lgb
-        self.model = lgb.LGBMClassifier(**params)
+        self.params = params
+        self.model = None
 
     def fit(self, X, y):
+        self.model = lgb.LGBMClassifier(**self.params)
         self.model.fit(X, y)
         return self
 
     def predict(self, X):
+        if self.model is None:
+            raise ValueError("Model has not been fitted yet. Please call fit() before predict().")
         return self.model.predict(X)
 
     def predict_proba(self, X):
+        if self.model is None:
+            raise ValueError("Model has not been fitted yet. Please call fit() before predict_proba().")
         return self.model.predict_proba(X)
+
+# === 7. Transformer Wrapper ===
+class BaseTorchWrapper(BaseEstimator, ClassifierMixin):
+    def __init__(self, model_class, model_params=None, device=None, epochs=10, batch_size=32, lr=1e-3):
+        self.model_class = model_class
+        self.model_params = model_params or {}
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.model = None
+
+# === 8. RNN Wrapper ===
+    class SimpleRNN(nn.Module):
+        def __init__(self, input_size, hidden_size=64, num_layers=1):
+            super(SimpleRNN, self).__init__()
+            self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+            self.fc = nn.Linear(hidden_size, 1)
+
+        def forward(self, x):
+            out, _ = self.rnn(x.unsqueeze(1))  # (batch, seq_len=1, input_size)
+            out = self.fc(out[:, -1, :])
+            return out
+
+    def fit(self, X, y):
+        X = torch.tensor(X, dtype=torch.float32).to(self.device)
+        y = torch.tensor(y, dtype=torch.float32).to(self.device)
+
+        dataset = torch.utils.data.TensorDataset(X, y)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        self.model = self.model_class(**self.model_params).to(self.device)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        criterion = nn.BCEWithLogitsLoss()
+
+        self.model.train()
+        for epoch in range(self.epochs):
+            for batch_X, batch_y in loader:
+                optimizer.zero_grad()
+                outputs = self.model(batch_X).squeeze()
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+
+        return self
+
+    def predict_proba(self, X):
+        X = torch.tensor(X, dtype=torch.float32).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(X).squeeze()
+            probs = torch.sigmoid(outputs)
+        return torch.stack([1-probs, probs], dim=1).cpu().numpy()
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return (proba[:, 1] > 0.5).astype(int)
+
 
 # === 7. LightGBM重要度で上位特徴量を選択 ===
 def select_top_features_with_lightgbm(df, target, top_n=10):
@@ -391,10 +467,12 @@ def calc_p_mean_type1_error_rate(p_mean, n):
 
 # === 10. モデル作成 ===
 def create_model(model_type, params=None):
+    if params is None:
+        params = {}
     if model_type == 'lightgbm':
         return lgb.LGBMClassifier(verbose=-1, **params)
     elif model_type == 'xgboost':
-        return xgb.XGBClassifier(**params)
+        return xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **params)
     elif model_type == 'catboost':
         return CatBoostClassifier(verbose=0, **params)
     elif model_type == 'randomforest':
@@ -404,38 +482,35 @@ def create_model(model_type, params=None):
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
-# === 10. モデル作成
 def create_base_models(selected_models, best_params_dict):
     return [(name, create_model(name, best_params_dict[name])) for name in selected_models]
 
-# === 11. Optunaによるハイパーパラメータ最適化 ===
-def optimize_final_estimator(df, features):
+# --- 各モデルのハイパーパラメータ最適化 ---
+def optimize_hyperparameters(df, model_name, features):
     def objective(trial):
-        model_type = trial.suggest_categorical('model_type', ['lightgbm', 'xgboost', 'catboost', 'randomforest', 'mlp'])
-
-        if model_type == 'lightgbm':
+        if model_name == 'lightgbm':
             params = {
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
                 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
             }
-            model = LGBMClassifier(**params)
-        elif model_type == 'xgboost':
+            model = lgb.LGBMClassifier(**params)
+        elif model_name == 'xgboost':
             params = {
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
                 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
                 'gamma': trial.suggest_float('gamma', 0, 5),
             }
-            model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', **params)
-        elif model_type == 'catboost':
+            model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss', **params)
+        elif model_name == 'catboost':
             params = {
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
                 'depth': trial.suggest_int('depth', 3, 10),
                 'iterations': trial.suggest_int('iterations', 100, 1000),
             }
             model = CatBoostClassifier(verbose=0, **params)
-        elif model_type == 'randomforest':
+        elif model_name == 'randomforest':
             params = {
                 'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
                 'max_depth': trial.suggest_int('max_depth', 3, 10),
@@ -443,18 +518,41 @@ def optimize_final_estimator(df, features):
                 'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 5),
             }
             model = RandomForestClassifier(**params)
-        elif model_type == 'mlp':
+        elif model_name == 'mlp':
             params = {
                 'hidden_layer_sizes': trial.suggest_categorical('hidden_layer_sizes', [(100,), (100, 50), (200, 100)]),
                 'activation': trial.suggest_categorical('activation', ['relu', 'tanh']),
                 'solver': trial.suggest_categorical('solver', ['adam', 'sgd']),
                 'alpha': trial.suggest_float('alpha', 1e-5, 1e-2, log=True),
                 'learning_rate_init': trial.suggest_float('learning_rate_init', 1e-4, 1e-2),
-                'max_iter': 1000
+                'max_iter': 500
             }
             model = MLPClassifier(**params)
         else:
-            raise ValueError(f"Unsupported model type: {model_type}")
+            raise ValueError(f"Unsupported model: {model_name}")
+
+        scores = []
+        tscv = TimeSeriesSplit(n_splits=3)
+        for train_idx, test_idx in tscv.split(df):
+            X_train, X_test = df.iloc[train_idx][features], df.iloc[test_idx][features]
+            y_train, y_test = df.iloc[train_idx]['long_target'], df.iloc[test_idx]['long_target']
+            model.fit(X_train, y_train)
+            preds = model.predict_proba(X_test)[:, 1]
+            scores.append(log_loss(y_test, preds))
+
+        return np.mean(scores)
+
+    study = optuna.create_study(direction='minimize', pruner=MedianPruner())
+    study.optimize(objective, n_trials=30)
+
+    return study.best_params
+
+# === 11. Optunaによるハイパーパラメータ最適化 ===
+def optimize_final_estimator(df, features):
+    def objective(trial):
+        model_type = trial.suggest_categorical('model_type', ['lightgbm', 'xgboost', 'catboost', 'randomforest', 'mlp'])
+        params = optimize_hyperparameters(df, model_type, features)
+        model = create_model(model_type, params)
 
         scores = []
         tscv = TimeSeriesSplit(n_splits=3)
@@ -472,22 +570,8 @@ def optimize_final_estimator(df, features):
 
     best_model_type = study.best_params['model_type']
     best_params = {k: v for k, v in study.best_params.items() if k != 'model_type'}
-
-    # ベストモデルのインスタンスを作成して返す
-    if best_model_type == 'lightgbm':
-        model = LGBMClassifier(**best_params)
-    elif best_model_type == 'xgboost':
-        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', **best_params)
-    elif best_model_type == 'catboost':
-        model = CatBoostClassifier(verbose=0, **best_params)
-    elif best_model_type == 'randomforest':
-        model = RandomForestClassifier(**best_params)
-    elif best_model_type == 'mlp':
-        model = MLPClassifier(**best_params)
-    else:
-        raise ValueError(f"Unsupported model type: {best_model_type}")
-
-    return model
+    final_model = create_model(best_model_type, best_params)
+    return final_model
 
 # === 12. p平均法によるストラテジー有意性検定 ===
 def p_mean_test(returns, period=14, alpha=0.03):
@@ -778,9 +862,11 @@ def main():
         pbar.update(1)
 
         # ベースモデル最適化
-        best_params_dict = {model: optimize_hyperparameters(df, model) for model in SELECTED_MODELS}
-        base_models = create_base_models(SELECTED_MODELS, best_params_dict)
+        best_params_dict = {model: optimize_hyperparameters(df, model, FEATURES) for model in SELECTED_MODELS}
         pbar.update(1)
+
+        # ベースモデル生成
+        base_models = create_base_models(SELECTED_MODELS, best_params_dict)
 
         # ファイナルエスティメータ最適化
         final_estimator = optimize_final_estimator(df, FEATURES)
